@@ -678,9 +678,10 @@ fn renderSprites(self: *Ppu, y: u16, dispcnt: u16) void {
         const attr2 = @as(u16, self.bus.oam[oam_addr + 4]) | (@as(u16, self.bus.oam[oam_addr + 5]) << 8);
 
         const affine = (attr0 & 0x0100) != 0;
+        // Bit 9 means "disable" for non-affine, "double-size area" for affine.
         if (!affine and (attr0 & 0x0200) != 0) continue;
+        const double_size = affine and (attr0 & 0x0200) != 0;
 
-        // attr0 bits 11-10 = OBJ mode: 0=normal, 1=semi-transparent, 2=obj-window.
         const obj_mode: u2 = @intCast((attr0 >> 10) & 0x3);
         if (obj_mode == 3) continue; // forbidden
 
@@ -690,11 +691,15 @@ fn renderSprites(self: *Ppu, y: u16, dispcnt: u16) void {
         const w = dims[0];
         const h = dims[1];
 
+        // Bounding box (the rendering area) — 2× sprite size if double_size.
+        const bbox_w: u32 = if (double_size) w * 2 else w;
+        const bbox_h: u32 = if (double_size) h * 2 else h;
+
         const sy_raw: u8 = @intCast(attr0 & 0xFF);
         var sy: i32 = sy_raw;
         if (sy >= 160) sy -= 256;
 
-        if (@as(i32, y) < sy or @as(i32, y) >= sy + @as(i32, @intCast(h))) continue;
+        if (@as(i32, y) < sy or @as(i32, y) >= sy + @as(i32, @intCast(bbox_h))) continue;
 
         const sx_raw: u32 = attr1 & 0x1FF;
         var sx: i32 = @intCast(sx_raw);
@@ -705,23 +710,54 @@ fn renderSprites(self: *Ppu, y: u16, dispcnt: u16) void {
         const tile_num: u32 = attr2 & 0x3FF;
         const pal_bank: u32 = (@as(u32, attr2) >> 12) & 0xF;
 
+        // Affine matrix from OAM rotation/scaling group (attr1 bits 13-9).
+        // Each group is 32 bytes apart; PA at +0x06, PB +0x0E, PC +0x16,
+        // PD +0x1E (relative to group base).
+        const affine_group: u32 = @intCast((attr1 >> 9) & 0x1F);
+        const aff_base = affine_group * 0x20;
+        const pa: i32 = if (affine) @as(i32, @as(i16, @bitCast(@as(u16, self.bus.oam[aff_base + 0x06]) | (@as(u16, self.bus.oam[aff_base + 0x07]) << 8)))) else 0x100;
+        const pb: i32 = if (affine) @as(i32, @as(i16, @bitCast(@as(u16, self.bus.oam[aff_base + 0x0E]) | (@as(u16, self.bus.oam[aff_base + 0x0F]) << 8)))) else 0;
+        const pc: i32 = if (affine) @as(i32, @as(i16, @bitCast(@as(u16, self.bus.oam[aff_base + 0x16]) | (@as(u16, self.bus.oam[aff_base + 0x17]) << 8)))) else 0;
+        const pd: i32 = if (affine) @as(i32, @as(i16, @bitCast(@as(u16, self.bus.oam[aff_base + 0x1E]) | (@as(u16, self.bus.oam[aff_base + 0x1F]) << 8)))) else 0x100;
+
         const flip_h = !affine and (attr1 & 0x1000) != 0;
         const flip_v = !affine and (attr1 & 0x2000) != 0;
 
-        const py_in_sprite_raw: u32 = @intCast(@as(i32, y) - sy);
-        const py_in = if (flip_v) (h - 1 - py_in_sprite_raw) else py_in_sprite_raw;
+        // dy = y offset from sprite-top within the rendering bbox.
+        const dy_raw: i32 = @as(i32, y) - sy;
+        // For non-affine, compute py_in directly. For affine, use the
+        // PC/PD matrix per pixel below.
+        const py_in_sprite_raw: u32 = @intCast(dy_raw);
 
         var px: u32 = 0;
-        while (px < w) : (px += 1) {
+        while (px < bbox_w) : (px += 1) {
             const sx_pixel = sx + @as(i32, @intCast(px));
             if (sx_pixel < 0 or sx_pixel >= 240) continue;
             const dst_x: usize = @intCast(sx_pixel);
-            const px_in = if (flip_h) (w - 1 - px) else px;
 
-            const tile_x = px_in / 8;
-            const tile_y = py_in / 8;
-            const tile_px = px_in & 7;
-            const tile_py = py_in & 7;
+            // Resolve the source-sprite pixel (tx, ty) in [0,w) × [0,h).
+            var tx: i32 = undefined;
+            var ty: i32 = undefined;
+            if (affine) {
+                // Texel center is (W/2, H/2) within source space; the
+                // bbox center is (bbox_w/2, bbox_h/2). Distance from
+                // bbox-center, transformed by the matrix, plus W/2 / H/2.
+                const dx_centered: i32 = @as(i32, @intCast(px)) - @as(i32, @intCast(bbox_w >> 1));
+                const dy_centered: i32 = dy_raw - @as(i32, @intCast(bbox_h >> 1));
+                tx = ((pa * dx_centered + pb * dy_centered) >> 8) + @as(i32, @intCast(w >> 1));
+                ty = ((pc * dx_centered + pd * dy_centered) >> 8) + @as(i32, @intCast(h >> 1));
+                if (tx < 0 or ty < 0 or tx >= @as(i32, @intCast(w)) or ty >= @as(i32, @intCast(h))) continue;
+            } else {
+                const px_in = if (flip_h) (w - 1 - px) else px;
+                const py_in = if (flip_v) (h - 1 - py_in_sprite_raw) else py_in_sprite_raw;
+                tx = @intCast(px_in);
+                ty = @intCast(py_in);
+            }
+
+            const tile_x: u32 = @intCast(@divTrunc(tx, 8));
+            const tile_y: u32 = @intCast(@divTrunc(ty, 8));
+            const tile_px: u32 = @intCast(@mod(tx, 8));
+            const tile_py: u32 = @intCast(@mod(ty, 8));
 
             const tile_step_x: u32 = if (palette_256) 2 else 1;
             const tile_stride_y: u32 = if (obj_one_d)
