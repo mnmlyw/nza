@@ -20,6 +20,8 @@ const Args = struct {
     press_script: ?[]const u8 = null,
     snapshot_test: bool = false,
     gdb_port: ?u16 = null,
+    link_host_port: ?u16 = null,
+    link_connect: ?[]const u8 = null,
 };
 
 fn parseArgs(init: std.process.Init.Minimal) !Args {
@@ -48,6 +50,11 @@ fn parseArgs(init: std.process.Init.Minimal) !Args {
         } else if (std.mem.eql(u8, arg, "--gdbserver")) {
             const v = it.next() orelse return error.MissingGdbPortValue;
             args.gdb_port = std.fmt.parseInt(u16, v, 10) catch return error.BadGdbPortValue;
+        } else if (std.mem.eql(u8, arg, "--link-host")) {
+            const v = it.next() orelse return error.MissingLinkHostPort;
+            args.link_host_port = std.fmt.parseInt(u16, v, 10) catch return error.BadLinkHostPort;
+        } else if (std.mem.eql(u8, arg, "--link-connect")) {
+            args.link_connect = it.next() orelse return error.MissingLinkConnect;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("unknown flag: {s}\n", .{arg});
             return error.UnknownFlag;
@@ -196,6 +203,27 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var gdb: ?gdb_mod.GdbServer = if (args.gdb_port) |p| gdb_mod.GdbServer.init(p) else null;
     defer if (gdb) |*g| g.deinit();
 
+    // Optional TCP link cable (multiplayer).
+    const link_mod = @import("core/link.zig");
+    var link: ?link_mod.Link = blk: {
+        if (args.link_host_port) |p| break :blk link_mod.Link.initHost(p);
+        if (args.link_connect) |hp| {
+            const colon = std.mem.indexOfScalar(u8, hp, ':') orelse break :blk null;
+            const host = hp[0..colon];
+            const port_str = hp[colon + 1 ..];
+            const port = std.fmt.parseInt(u16, port_str, 10) catch break :blk null;
+            // Need a null-terminated host string for inet_addr.
+            var host_buf: [256]u8 = undefined;
+            if (host.len >= host_buf.len) break :blk null;
+            @memcpy(host_buf[0..host.len], host);
+            host_buf[host.len] = 0;
+            break :blk link_mod.Link.initClient(@ptrCast(&host_buf), port);
+        }
+        break :blk null;
+    };
+    defer if (link) |*l| l.deinit();
+    if (link) |*l| core.bus.io.link = l;
+
     var fe = try sdl.Frontend.init();
     defer fe.deinit();
 
@@ -223,6 +251,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // frame; if the queue grows too large we drop the excess to keep
     // latency bounded.
     while (fe.pollEvents(&core.keypad, &hotkeys, allocator)) {
+        if (link) |*l| _ = l.pollAccept();
+
         for (hotkeys.items) |hk| switch (hk) {
             .save_state => core.saveStateToFile() catch |e|
                 std.debug.print("save-state failed: {s}\n", .{@errorName(e)}),
@@ -384,6 +414,7 @@ test {
     _ = @import("core/gpio.zig");
     _ = @import("core/cheats.zig");
     _ = @import("core/gdbserver.zig");
+    _ = @import("core/link.zig");
     _ = @import("core/snapshot.zig");
     _ = @import("frontend/config.zig");
     _ = @import("apu/apu.zig");

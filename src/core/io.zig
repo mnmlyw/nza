@@ -10,6 +10,7 @@ const Keypad = @import("../keypad/keypad.zig").Keypad;
 const Dma = @import("../dma/dma.zig").Dma;
 const Timers = @import("../timer/timer.zig").Timers;
 const Apu = @import("../apu/apu.zig").Apu;
+const link_mod = @import("link.zig");
 
 pub const SIZE: u32 = 0x400;
 
@@ -44,6 +45,7 @@ pub const Io = struct {
     dma: ?*Dma = null,
     timers: ?*Timers = null,
     apu: ?*Apu = null,
+    link: ?*link_mod.Link = null,
 
     /// DISPSTAT bits: 0=VBlank flag, 1=HBlank flag, 2=VCount match,
     /// 3=VBlank IRQ enable, 4=HBlank IRQ enable, 5=VCount IRQ enable,
@@ -157,12 +159,21 @@ pub const Io = struct {
                     if ((value & 0x80) != 0) {
                         // Clear start bit; transfer "done".
                         self.raw[REG_SIOCNT + 1] = value & 0x7F;
-                        // Multi mode: load SIOMULTI0..3 with 0xFFFF (no data
-                        // from absent peers); set this GBA's slot index to 0.
-                        const cnt_lo = self.raw[REG_SIOCNT];
-                        const mode_bits: u2 = @intCast((cnt_lo >> 4) & 0x3);
-                        _ = mode_bits;
+                        // Default SIOMULTI0..3 to 0xFFFF (absent peers).
                         for (0..8) |i| self.raw[REG_SIOMULTI0 + i] = 0xFF;
+                        if (self.link) |lk| if (lk.isConnected()) {
+                            // Exchange Multi-mode value with the peer.
+                            const my_value: u16 = @as(u16, self.raw[REG_SIOMULTI0 + 8]) | (@as(u16, self.raw[REG_SIOMULTI0 + 9]) << 8);
+                            lk.sendValue(my_value);
+                            _ = lk.poll();
+                            // Host = slot 0, client = slot 1.
+                            const my_slot: u32 = if (lk.role == .host) 0 else 1;
+                            const peer_slot: u32 = 1 - my_slot;
+                            self.raw[REG_SIOMULTI0 + my_slot * 2] = @truncate(my_value);
+                            self.raw[REG_SIOMULTI0 + my_slot * 2 + 1] = @truncate(my_value >> 8);
+                            self.raw[REG_SIOMULTI0 + peer_slot * 2] = @truncate(lk.peer_value);
+                            self.raw[REG_SIOMULTI0 + peer_slot * 2 + 1] = @truncate(lk.peer_value >> 8);
+                        };
                         // IRQ on completion if SIOCNT bit 14 is set.
                         if ((value & 0x40) != 0) {
                             if (self.irq) |x| x.raise(.serial);
