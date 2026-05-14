@@ -457,8 +457,11 @@ pub fn blockTransferHandler(comptime top: u8) decode.ArmFn {
                 const reg: u4 = @intCast(i);
                 const access: @TypeOf(cpu.bus.*).Access = if (first) .nonseq else .seq;
                 first = false;
+                // ARM7TDMI silently word-aligns LDM/STM addresses — the
+                // low 2 bits of `cur` are treated as 0 by the bus.
+                const aligned_cur = cur & ~@as(u32, 3);
                 if (L) {
-                    cpu.r[reg] = cpu.bus.readTimed(u32, cur, access);
+                    cpu.r[reg] = cpu.bus.readTimed(u32, aligned_cur, access);
                     if (reg == 15) {
                         if (S) restoreCpsrFromSpsr(cpu);
                         cpu.reloadPipeline();
@@ -466,7 +469,7 @@ pub fn blockTransferHandler(comptime top: u8) decode.ArmFn {
                 } else {
                     var v = cpu.r[reg];
                     if (reg == 15) v +%= 4;
-                    cpu.bus.writeTimed(u32, cur, access, v);
+                    cpu.bus.writeTimed(u32, aligned_cur, access, v);
                 }
                 cur +%= 4;
             }

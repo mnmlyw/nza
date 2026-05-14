@@ -570,8 +570,10 @@ pub fn pushPopHandler(comptime is_pop: bool, comptime has_lr_pc: bool) decode.Th
                 if (has_lr_pc) {
                     const new_pc = cpu.bus.read(u32, sp);
                     sp +%= 4;
-                    cpu.cpsr.thumb = (new_pc & 1) != 0;
-                    cpu.r[15] = new_pc & ~@as(u32, if (cpu.cpsr.thumb) 1 else 3);
+                    // ARMv4T (ARM7TDMI) POP-pc stays in Thumb; bit 0 is
+                    // *not* used for mode switching. Only BX interworks
+                    // on this architecture. (Mode-switching POP is ARMv5+.)
+                    cpu.r[15] = new_pc & ~@as(u32, 1);
                     cpu.reloadPipeline();
                 }
                 cpu.r[13] = sp;

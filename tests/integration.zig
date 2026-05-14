@@ -112,6 +112,9 @@ test "thumb.gba" {
 test "memory.gba" {
     const result = (try runRom("memory.gba", DEFAULT_FRAMES)) orelse return;
     std.debug.print("[run] memory.gba hash=0x{x:0>16} pc=0x{x:0>8}\n", .{ result.framebuffer_hash, result.last_pc });
+    // M3.5 fix: byte STRB rules for OAM/PRAM/VRAM corrected. Hash matches
+    // the "all subtests pass" framebuffer.
+    try std.testing.expectEqual(@as(u64, 0xe5ab36d2fca96065), result.framebuffer_hash);
 }
 
 test "nes.gba" {

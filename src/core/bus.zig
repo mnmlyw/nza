@@ -149,9 +149,40 @@ pub const Bus = struct {
                     self.applyWaitCnt();
                 }
             },
-            0x5 => writeSlice(T, self.pram[0..], addr & (PRAM_SIZE - 1), value),
-            0x6 => writeSlice(T, self.vram[0..], vramAddr(addr), value),
-            0x7 => writeSlice(T, self.oam[0..], addr & (OAM_SIZE - 1), value),
+            0x5 => {
+                // PRAM: byte writes replicate as halfword (real HW: 16-bit bus).
+                if (@typeInfo(T).int.bits == 8) {
+                    const b: u8 = @intCast(value);
+                    const ho: u32 = (addr & (PRAM_SIZE - 1)) & ~@as(u32, 1);
+                    self.pram[ho] = b;
+                    self.pram[ho + 1] = b;
+                } else {
+                    writeSlice(T, self.pram[0..], addr & (PRAM_SIZE - 1), value);
+                }
+            },
+            0x6 => {
+                // VRAM byte writes: ignored in tile-data areas (BG modes 0/1/2
+                // upper region, and OBJ tile area regardless of mode); mirrored
+                // as halfword in bitmap-data areas (BG2 bitmap for modes 3/4/5).
+                if (@typeInfo(T).int.bits == 8) {
+                    const v_off = vramAddr(addr);
+                    const dispcnt_mode: u3 = @intCast(self.io.read(u16, 0x000) & 0x7);
+                    const obj_start: u32 = if (dispcnt_mode >= 3) 0x14000 else 0x10000;
+                    if (v_off >= obj_start) return; // OBJ tile area — ignore
+                    const b: u8 = @intCast(value);
+                    const ho: u32 = v_off & ~@as(u32, 1);
+                    self.vram[ho] = b;
+                    self.vram[ho + 1] = b;
+                } else {
+                    writeSlice(T, self.vram[0..], vramAddr(addr), value);
+                }
+            },
+            0x7 => {
+                // OAM byte writes are dropped on real hardware.
+                if (@typeInfo(T).int.bits != 8) {
+                    writeSlice(T, self.oam[0..], addr & (OAM_SIZE - 1), value);
+                }
+            },
             0x8, 0x9, 0xA, 0xB, 0xC, 0xD => self.writeRomRegion(T, addr, region, value),
             0xE, 0xF => self.writeBackup(T, addr & (SRAM_SIZE - 1), value),
             else => {},
