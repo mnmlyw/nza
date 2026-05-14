@@ -11,6 +11,7 @@ const bios = @import("bios.zig");
 const flash_mod = @import("flash.zig");
 const eeprom_mod = @import("eeprom.zig");
 const gpio_mod = @import("gpio.zig");
+const cheats_mod = @import("cheats.zig");
 const save_file = @import("save_file.zig");
 const snapshot = @import("snapshot.zig");
 const ppu_mod = @import("../ppu/ppu.zig");
@@ -41,6 +42,7 @@ pub const Core = struct {
     cart: ?cart.Cartridge = null,
     eeprom: ?eeprom_mod.Eeprom = null,
     gpio: ?gpio_mod.Gpio = null,
+    cheats: cheats_mod.Cheats = .{},
     irq_entry_count: u64 = 0,
     frames_run: u64 = 0,
 
@@ -96,6 +98,7 @@ pub const Core = struct {
     pub fn deinit(self: *Core) void {
         self.flushSaveIfDirty();
         if (self.cart) |*c| c.deinit(self.allocator);
+        self.cheats.deinit(self.allocator);
         for (&self.rewind_ring) |*slot| {
             if (slot.*) |s| self.allocator.free(s);
             slot.* = null;
@@ -253,6 +256,18 @@ pub const Core = struct {
             }
         }
         self.bus.save_dirty = false;
+        // Try to load `<rom>.cheats` next to the ROM.
+        if (self.cart.?.save_path) |p| {
+            const slen = p.len - 4;
+            var cheats_path = self.allocator.alloc(u8, slen + 7) catch return;
+            defer self.allocator.free(cheats_path);
+            @memcpy(cheats_path[0..slen], p[0..slen]);
+            @memcpy(cheats_path[slen..], ".cheats");
+            self.cheats.loadFromFile(self.allocator, cheats_path) catch {};
+            if (self.cheats.codes.items.len > 0) {
+                std.debug.print("[cheats] loaded {d} codes from {s}\n", .{ self.cheats.codes.items.len, cheats_path });
+            }
+        }
     }
 
     /// Flush dirty backup chip bytes to `<rom>.sav`. Called at frame end
@@ -374,6 +389,7 @@ pub const Core = struct {
             self.scheduler.addCycles(self.cpu.cycles);
         }
         self.frames_run += 1;
+        if (self.cheats.codes.items.len > 0) self.cheats.applyAll(&self.bus);
         if (self.frames_run % 60 == 0 and self.bus.save_dirty) {
             self.flushSaveIfDirty();
         }
