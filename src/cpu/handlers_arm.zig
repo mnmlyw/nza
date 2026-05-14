@@ -463,33 +463,53 @@ pub fn mulHandler(comptime opcode: u4) decode.ArmFn {
     const set_flags = (opcode & 0b0001) != 0;
     return struct {
         fn handler(cpu: *Cpu, instr: u32) void {
-            const rd: u4 = @intCast((instr >> 16) & 0xF);
-            const rn: u4 = @intCast((instr >> 12) & 0xF); // accumulator when MLA
-            const rs: u4 = @intCast((instr >> 8) & 0xF);
-            const rm: u4 = @intCast(instr & 0xF);
-            var result: u32 = cpu.r[rm] *% cpu.r[rs];
-            if (accumulate) result +%= cpu.r[rn];
-            cpu.r[rd] = result;
+            const dst: u4 = @intCast((instr >> 16) & 0xF);
+            const op3: u4 = @intCast((instr >> 12) & 0xF); // accumulator for MLA
+            const op2: u4 = @intCast((instr >> 8) & 0xF);
+            const op1: u4 = @intCast(instr & 0xF);
+            // NBA: state.r15 += 4; pipe.access = NSeq; bus.Idle()×N
+            cpu.r[15] +%= 4;
+            cpu.branched = true;
+            const lhs = cpu.r[op1];
+            const rhs = cpu.r[op2];
+            var result: u32 = lhs *% rhs;
+            _ = tickMultiply(cpu, true, rhs);
+            if (accumulate) {
+                result +%= cpu.r[op3];
+                cpu.bus.wait_cycles_accum +%= 1; // bus.Idle()
+            }
             if (set_flags) {
                 cpu.cpsr.negative = (result & 0x8000_0000) != 0;
                 cpu.cpsr.zero = result == 0;
-                // C is UNPREDICTABLE on ARM7TDMI MUL; leave unchanged.
+                // C flag for MUL is UNPREDICTABLE per ARM spec; leave alone.
             }
-            // I-cycle accounting: 1 + N based on Rs top-byte zero/one-detect.
-            // MUL = N internal cycles; MLA = N+1.
-            cpu.bus.wait_cycles_accum +%= mulInternalCycles(cpu.r[rs]);
-            if (accumulate) cpu.bus.wait_cycles_accum +%= 1;
+            cpu.r[dst] = result;
+            if (dst == 15) cpu.reloadPipeline();
         }
     }.handler;
 }
 
-/// ARM7TDMI variable-N timing for MUL/MLA: depends on which of the high
-/// bytes of Rs are all-zero or all-one (early-termination booth multiplier).
-fn mulInternalCycles(rs: u32) u8 {
-    if ((rs & 0xFFFF_FF00) == 0 or (rs & 0xFFFF_FF00) == 0xFFFF_FF00) return 1;
-    if ((rs & 0xFFFF_0000) == 0 or (rs & 0xFFFF_0000) == 0xFFFF_0000) return 2;
-    if ((rs & 0xFF00_0000) == 0 or (rs & 0xFF00_0000) == 0xFF00_0000) return 3;
-    return 4;
+/// Convenience: tickMultiply for callers that don't care about signedness.
+pub fn tickMultiplyPub(cpu: *Cpu, multiplier: u32) bool {
+    return tickMultiply(cpu, true, multiplier);
+}
+
+/// Port of NBA's TickMultiply: simulate ARM7TDMI's Booth multiplier
+/// early-termination on byte-zero/byte-all-ones detect. Returns true
+/// when all 4 bytes were processed.
+fn tickMultiply(cpu: *Cpu, is_signed: bool, multiplier_in: u32) bool {
+    var multiplier = multiplier_in;
+    var mask: u32 = 0xFFFF_FF00;
+    cpu.bus.wait_cycles_accum +%= 1; // initial bus.Idle()
+    while (true) {
+        multiplier &= mask;
+        if (multiplier == 0) break;
+        if (is_signed and multiplier == mask) break;
+        mask <<= 8;
+        if (mask == 0) break;
+        cpu.bus.wait_cycles_accum +%= 1;
+    }
+    return mask == 0;
 }
 
 // =====================================================================
@@ -568,29 +588,40 @@ pub fn mulLongHandler(comptime uas: u3) decode.ArmFn {
             const rs: u4 = @intCast((instr >> 8) & 0xF);
             const rm: u4 = @intCast(instr & 0xF);
 
+            // NBA: state.r15 += 4; pipe.access = NSeq
+            cpu.r[15] +%= 4;
+            cpu.branched = true;
+
+            const lhs = cpu.r[rm];
+            const rhs = cpu.r[rs];
             const product: u64 = if (unsigned)
-                @as(u64, cpu.r[rm]) *% @as(u64, cpu.r[rs])
+                @as(u64, lhs) *% @as(u64, rhs)
             else blk: {
-                const a: i64 = @as(i32, @bitCast(cpu.r[rm]));
-                const b: i64 = @as(i32, @bitCast(cpu.r[rs]));
+                const a: i64 = @as(i32, @bitCast(lhs));
+                const b: i64 = @as(i32, @bitCast(rhs));
                 break :blk @bitCast(a *% b);
             };
 
-            const acc: u64 = if (accumulate)
-                (@as(u64, cpu.r[rd_hi]) << 32) | @as(u64, cpu.r[rd_lo])
-            else
-                0;
-            const result = product +% acc;
+            _ = tickMultiply(cpu, !unsigned, rhs);
+            cpu.bus.wait_cycles_accum +%= 1; // unconditional bus.Idle() after mul
+
+            var result: u64 = product;
+            if (accumulate) {
+                const acc: u64 = (@as(u64, cpu.r[rd_hi]) << 32) | @as(u64, cpu.r[rd_lo]);
+                result +%= acc;
+                cpu.bus.wait_cycles_accum +%= 1; // bus.Idle() for accumulate
+            }
+
             cpu.r[rd_lo] = @truncate(result);
             cpu.r[rd_hi] = @truncate(result >> 32);
 
             if (set_flags) {
                 cpu.cpsr.negative = (result & 0x8000_0000_0000_0000) != 0;
                 cpu.cpsr.zero = result == 0;
+                // C is UNPREDICTABLE on ARM7TDMI long-mul; leave alone.
             }
-            // MULL takes mul-cycles +1, MLAL takes +2 over mulInternalCycles(Rs).
-            cpu.bus.wait_cycles_accum +%= mulInternalCycles(cpu.r[rs]) + 1;
-            if (accumulate) cpu.bus.wait_cycles_accum +%= 1;
+
+            if (rd_lo == 15 or rd_hi == 15) cpu.reloadPipeline();
         }
     }.handler;
 }

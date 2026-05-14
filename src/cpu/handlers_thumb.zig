@@ -187,7 +187,8 @@ pub fn aluHandler(cpu: *Cpu, instr: u16) void {
             cpu.r[rd] = r;
             setNZ(cpu, r);
         },
-        0x2 => { // LSL Rd, Rs
+        0x2 => { // LSL Rd, Rs — NBA adds bus.Idle() for register-shift
+            cpu.bus.wait_cycles_accum +%= 1;
             const amt = b & 0xFF;
             if (amt == 0) {
                 setNZ(cpu, a);
@@ -207,6 +208,7 @@ pub fn aluHandler(cpu: *Cpu, instr: u16) void {
             }
         },
         0x3 => { // LSR Rd, Rs
+            cpu.bus.wait_cycles_accum +%= 1;
             const amt = b & 0xFF;
             if (amt == 0) {
                 setNZ(cpu, a);
@@ -226,6 +228,7 @@ pub fn aluHandler(cpu: *Cpu, instr: u16) void {
             }
         },
         0x4 => { // ASR Rd, Rs
+            cpu.bus.wait_cycles_accum +%= 1;
             const amt = b & 0xFF;
             if (amt == 0) {
                 setNZ(cpu, a);
@@ -254,6 +257,7 @@ pub fn aluHandler(cpu: *Cpu, instr: u16) void {
             setSbcFlags(cpu, a, b, borrow, r);
         },
         0x7 => { // ROR Rd, Rs
+            cpu.bus.wait_cycles_accum +%= 1;
             const amt = b & 0xFF;
             if (amt == 0) {
                 setNZ(cpu, a);
@@ -289,11 +293,13 @@ pub fn aluHandler(cpu: *Cpu, instr: u16) void {
             cpu.r[rd] = r;
             setNZ(cpu, r);
         },
-        0xD => { // MUL
+        0xD => { // MUL — NBA bills TickMultiply (1+N I-cycles)
+            const arm = @import("handlers_arm.zig");
+            _ = arm.tickMultiplyPub(cpu, b);
             const r = a *% b;
             cpu.r[rd] = r;
             setNZ(cpu, r);
-            // C is UNPREDICTABLE; leave alone.
+            // C is UNPREDICTABLE per ARM7TDMI spec; leave alone.
         },
         0xE => { // BIC
             const r = a & ~b;
