@@ -424,6 +424,7 @@ test {
     _ = @import("cpu/handlers_arm.zig");
     _ = @import("cpu/handlers_thumb.zig");
     _ = @import("cpu/jit.zig");
+    _ = @import("cpu/jit_native.zig");
     _ = @import("irq/irq.zig");
     _ = @import("ppu/ppu.zig");
     _ = @import("dma/dma.zig");
