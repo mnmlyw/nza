@@ -19,6 +19,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Cpu = @import("arm7tdmi.zig").Cpu;
+const decode = @import("decode.zig");
 
 // ----------------------------------------------------------------------
 // Darwin / Linux JIT page management
@@ -106,6 +107,58 @@ pub const Emitter = struct {
     pub fn ret(self: *Emitter) void {
         self.write(0xD65F03C0);
     }
+
+    /// MOVZ Xd, #imm16, LSL #shift — 64-bit version.
+    pub fn movzX(self: *Emitter, xd: u5, imm16: u16, shift: u6) void {
+        const hw: u32 = shift / 16;
+        self.write(0xD2800000 | (hw << 21) | (@as(u32, imm16) << 5) | @as(u32, xd));
+    }
+
+    /// MOVK Xd, #imm16, LSL #shift — 64-bit keep.
+    pub fn movkX(self: *Emitter, xd: u5, imm16: u16, shift: u6) void {
+        const hw: u32 = shift / 16;
+        self.write(0xF2800000 | (hw << 21) | (@as(u32, imm16) << 5) | @as(u32, xd));
+    }
+
+    /// Load a 64-bit immediate into Xd in up to four halfword moves.
+    pub fn loadX(self: *Emitter, xd: u5, value: u64) void {
+        self.movzX(xd, @truncate(value), 0);
+        if ((value >> 16) & 0xFFFF != 0) self.movkX(xd, @truncate(value >> 16), 16);
+        if ((value >> 32) & 0xFFFF != 0) self.movkX(xd, @truncate(value >> 32), 32);
+        if ((value >> 48) & 0xFFFF != 0) self.movkX(xd, @truncate(value >> 48), 48);
+    }
+
+    /// BLR Xn — call function at the address in Xn.
+    pub fn blr(self: *Emitter, xn: u5) void {
+        self.write(0xD63F0000 | (@as(u32, xn) << 5));
+    }
+
+    /// MOV Xd, Xm — alias of ORR Xd, XZR, Xm.
+    pub fn movXX(self: *Emitter, xd: u5, xm: u5) void {
+        self.write(0xAA0003E0 | (@as(u32, xm) << 16) | @as(u32, xd));
+    }
+
+    /// SUB SP, SP, #imm12.
+    pub fn subSpImm(self: *Emitter, imm12: u12) void {
+        self.write(0xD10003FF | (@as(u32, imm12) << 10));
+    }
+
+    /// ADD SP, SP, #imm12.
+    pub fn addSpImm(self: *Emitter, imm12: u12) void {
+        self.write(0x910003FF | (@as(u32, imm12) << 10));
+    }
+
+    /// STR Xt, [SP, #imm12*8] — 64-bit store, unsigned offset.
+    pub fn strXImmU(self: *Emitter, xt: u5, byte_off: u15) void {
+        const imm12: u32 = @intCast(byte_off >> 3);
+        self.write(0xF90003E0 | (imm12 << 10) | @as(u32, xt));
+    }
+
+    /// LDR Xt, [SP, #imm12*8].
+    pub fn ldrXImmU(self: *Emitter, xt: u5, byte_off: u15) void {
+        const imm12: u32 = @intCast(byte_off >> 3);
+        self.write(0xF94003E0 | (imm12 << 10) | @as(u32, xt));
+    }
 };
 
 /// Translate a single ARM instruction. Returns true if translation
@@ -143,6 +196,62 @@ pub fn translateArm(em: *Emitter, instr: u32) bool {
         }
     }
     return false;
+}
+
+/// C-ABI trampoline so the JIT-emitted call site can use AAPCS64
+/// register passing (X0=cpu, X1=instr) regardless of how Zig chooses
+/// to pass args to its `.auto`-convention handlers.
+pub fn callArmHandler(cpu: *Cpu, instr: u32) callconv(.c) void {
+    const hash: u12 = @intCast(((instr >> 16) & 0xFF0) | ((instr >> 4) & 0x00F));
+    decode.arm_lut[hash](cpu, instr);
+}
+
+/// Compile a sequence of ARM instructions into a function-pointer that
+/// executes the whole block. Recognized instructions emit native code;
+/// unrecognized ones emit a call to the interpreter handler — making
+/// instruction coverage *complete*, just with varying speedup.
+///
+/// Function shape:
+///   fn(cpu: *Cpu) void
+/// Body shape (per instruction):
+///   if native: emit translation
+///   else:      emit MOV X0, X19 / MOVZ X1, instr / loadX X16, &handler / BLR X16
+pub fn compileBlock(page: *CodePage, instrs: []const u32) ?NativeFn {
+    if (page.used + 64 + instrs.len * 32 > page.len) return null;
+    if (builtin.os.tag == .macos) pthread_jit_write_protect_np(0);
+    defer if (builtin.os.tag == .macos) pthread_jit_write_protect_np(1);
+
+    var em = Emitter{ .buf = page.mem + page.used, .cap = page.len - page.used };
+    const start = page.mem + page.used;
+
+    // Prologue: stash X19 + LR, then keep CPU pointer in X19.
+    em.subSpImm(16);
+    em.strXImmU(19, 0);
+    em.strXImmU(30, 8);
+    em.movXX(19, 0);
+
+    for (instrs) |instr| {
+        if (translateArm(&em, instr)) {
+            // Native translation done.
+        } else {
+            // Fall back to interpreter via the C-ABI trampoline.
+            em.movXX(0, 19); // X0 = cpu pointer
+            em.movzX(1, @truncate(instr & 0xFFFF), 0);
+            if ((instr >> 16) & 0xFFFF != 0) em.movkX(1, @truncate(instr >> 16), 16);
+            em.loadX(16, @intFromPtr(&callArmHandler));
+            em.blr(16);
+        }
+    }
+
+    // Epilogue.
+    em.ldrXImmU(19, 0);
+    em.ldrXImmU(30, 8);
+    em.addSpImm(16);
+    em.ret();
+
+    page.used += em.pos;
+    sys_icache_invalidate(start, em.pos);
+    return @ptrCast(@alignCast(start));
 }
 
 /// Compile one ARM instruction into a callable function pointer. Used
@@ -191,6 +300,27 @@ test "JIT refuses unsupported instructions" {
     // ARM: SUB r0, r1, r2 (data-proc register, not immediate)
     const fn_ptr = compileSingle(&page, 0xE041_0002);
     try std.testing.expect(fn_ptr == null);
+}
+
+test "JIT block: native MOV + interpreter-fallback ADD" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return;
+    var page = CodePage.alloc() orelse return;
+    defer page.free();
+
+    // Instr 1: ARM MOV r5, #42 — native translation.
+    // Instr 2: ARM ADD r6, r5, #8 — falls back to interpreter handler.
+    //   Encoding: cond=E, op=001, opcode=0100=ADD, S=0, Rn=5, Rd=6, rot=0, imm=8
+    //   = 1110_0010_1000_0101_0110_0000_0000_1000 = 0xE285_6008
+    const block = [_]u32{ 0xE3A0_502A, 0xE285_6008 };
+    const fn_ptr = compileBlock(&page, &block) orelse return error.JitNotSupported;
+
+    var bus: @import("../core/bus.zig").Bus = .{};
+    var cpu = Cpu.init(&bus);
+    cpu.r[5] = 0;
+    cpu.r[6] = 0;
+    fn_ptr(&cpu);
+    try std.testing.expectEqual(@as(u32, 42), cpu.r[5]);
+    try std.testing.expectEqual(@as(u32, 50), cpu.r[6]);
 }
 
 test "JIT compiles ARM MVN r3, #0 and executes" {
