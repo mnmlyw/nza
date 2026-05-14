@@ -73,6 +73,7 @@ extern fn SDL_IsGameController(joystick_index: c_int) c_int;
 extern fn SDL_GameControllerOpen(joystick_index: c_int) ?*SDL_GameController;
 extern fn SDL_GameControllerClose(gamecontroller: *SDL_GameController) void;
 extern fn SDL_GameControllerEventState(state: c_int) c_int;
+extern fn SDL_GameControllerRumble(gamecontroller: *SDL_GameController, low_freq: u16, high_freq: u16, duration_ms: u32) c_int;
 
 extern fn SDL_Init(flags: u32) c_int;
 extern fn SDL_Quit() void;
@@ -238,6 +239,17 @@ pub const Frontend = struct {
         SDL_DestroyRenderer(self.renderer);
         SDL_DestroyWindow(self.window);
         SDL_Quit();
+    }
+
+    /// Trigger haptic rumble on the active controller (no-op if none).
+    /// Called by core's gpio.Rumble via the on_change callback.
+    pub fn setRumble(self: *Frontend, on: bool) void {
+        if (self.controller) |c| {
+            const amp: u16 = if (on) 0xFFFF else 0;
+            // 500 ms duration; the GPIO writes again before this elapses
+            // if the game keeps the motor on.
+            _ = SDL_GameControllerRumble(c, amp, amp, 500);
+        }
     }
 
     /// Open the first available game controller, if any.

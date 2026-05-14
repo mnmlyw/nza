@@ -227,6 +227,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var fe = try sdl.Frontend.init();
     defer fe.deinit();
 
+    // Wire gpio.Rumble's on-change callback to the frontend so rumble-cap
+    // ROMs (Drill Dozer, WarioWare Twisted) drive the gamepad motor.
+    if (core.gpio) |*g| {
+        g.rumble.on_change_ctx = &fe;
+        g.rumble.on_change = struct {
+            fn cb(ctx: *anyopaque, on: bool) void {
+                const f: *sdl.Frontend = @ptrCast(@alignCast(ctx));
+                f.setRumble(on);
+            }
+        }.cb;
+    }
+
     // Load user config (key remap, gamepad map, low-pass, fullscreen).
     const config = @import("frontend/config.zig");
     const cfg_path = config.defaultConfigPath(allocator) catch null;

@@ -267,12 +267,21 @@ pub const Solar = struct {
 
 pub const Rumble = struct {
     on: bool = false,
+    /// Frontend hook: called on every on/off transition. The SDL
+    /// frontend wires this to SDL_GameControllerRumble; headless
+    /// builds leave it null and just log.
+    on_change: ?*const fn (ctx: *anyopaque, on: bool) void = null,
+    on_change_ctx: ?*anyopaque = null,
 
     pub fn step(self: *Rumble, data: u16) void {
         const new_on = (data & 0x08) != 0; // pin 3
         if (new_on != self.on) {
             self.on = new_on;
-            std.debug.print("[rumble] {s}\n", .{if (new_on) "on" else "off"});
+            if (self.on_change) |cb| {
+                if (self.on_change_ctx) |ctx| cb(ctx, new_on);
+            } else {
+                std.debug.print("[rumble] {s}\n", .{if (new_on) "on" else "off"});
+            }
         }
     }
 };
