@@ -325,7 +325,9 @@ pub fn hiRegHandler(cpu: *Cpu, instr: u16) void {
     const rd: u4 = @as(u4, @intCast(instr & 7)) | (@as(u4, h1) << 3);
     const rs: u4 = @as(u4, @intCast((instr >> 3) & 7)) | (@as(u4, h2) << 3);
     const a = cpu.r[rd];
-    const b = cpu.r[rs];
+    var b = cpu.r[rs];
+    // NBA: when reading src=PC, mask bit 0 (`if (src == 15) operand &= ~1`).
+    if (rs == 15) b &= ~@as(u32, 1);
     switch (op) {
         0 => { // ADD (no flags)
             cpu.r[rd] = a +% b;
@@ -351,8 +353,14 @@ pub fn hiRegHandler(cpu: *Cpu, instr: u16) void {
                 @import("handlers_arm.zig").softResetExternal(cpu);
                 return;
             }
-            cpu.cpsr.thumb = (b & 1) != 0;
-            cpu.r[15] = b & ~@as(u32, if (cpu.cpsr.thumb) 1 else 3);
+            // NBA's BX-from-Thumb behavior: mask bit 0 unconditionally for
+            // ARM target (no word-align mask for r15 = address).
+            if ((b & 1) != 0) {
+                cpu.r[15] = b & ~@as(u32, 1);
+            } else {
+                cpu.cpsr.thumb = false;
+                cpu.r[15] = b;
+            }
             cpu.reloadPipeline();
         },
     }

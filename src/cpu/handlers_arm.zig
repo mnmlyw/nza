@@ -528,30 +528,34 @@ pub fn blockTransferHandler(comptime top: u8) decode.ArmFn {
         fn handler(cpu: *Cpu, instr: u32) void {
             const rn: u4 = @intCast((instr >> 16) & 0xF);
             const list: u16 = @truncate(instr);
-            const count: u32 = @popCount(list);
+            const transfer_pc = (list & 0x8000) != 0;
+            const count: u32 = if (list == 0) 16 else @popCount(list);
+            // Empty list edge case: NBA loads/stores R15 only and bumps base by 64.
+            const effective_list: u16 = if (list == 0) 0x8000 else list;
 
             const addr = cpu.r[rn];
-            // For "down" transfers, addresses count downward but registers
-            // are still loaded from lowest reg to highest at lowest address.
-            // Writeback always shifts Rn by ±count*4 in the transfer direction.
             const start_addr = if (U) addr else addr -% (count * 4);
             const end_addr = if (U) addr +% (count * 4) else addr -% (count * 4);
 
-            // Adjust for pre/post indexing of the *direction* of traversal.
             var cur: u32 = start_addr;
-            if (P == U) cur +%= 4; // (P=1, U=1) or (P=0, U=0) shifts by +4
+            if (P == U) cur +%= 4;
 
-            // First transfer is N-cycle, subsequent are S-cycle. Track
-            // whether we've done the first one yet.
+            // NBA's user-mode LDM/STM (the `^` form): when S is set and
+            // PC is NOT in the list (or it's a STM), temporarily switch
+            // to user-mode banked regs for the transfer.
+            const mode_save = cpu.cpsr.mode;
+            const switch_mode = S and (!L or !transfer_pc) and
+                mode_save != @intFromEnum(cpu_mod.Mode.user) and
+                mode_save != @intFromEnum(cpu_mod.Mode.sys);
+            if (switch_mode) cpu.switchMode(.user);
+
             var first = true;
             var i: u5 = 0;
             while (i < 16) : (i += 1) {
-                if ((list >> @intCast(i)) & 1 == 0) continue;
+                if ((effective_list >> @intCast(i)) & 1 == 0) continue;
                 const reg: u4 = @intCast(i);
                 const access: @TypeOf(cpu.bus.*).Access = if (first) .nonseq else .seq;
                 first = false;
-                // ARM7TDMI silently word-aligns LDM/STM addresses — the
-                // low 2 bits of `cur` are treated as 0 by the bus.
                 const aligned_cur = cur & ~@as(u32, 3);
                 if (L) {
                     cpu.r[reg] = cpu.bus.readTimed(u32, aligned_cur, access);
@@ -567,12 +571,15 @@ pub fn blockTransferHandler(comptime top: u8) decode.ArmFn {
                 cur +%= 4;
             }
 
+            const base_new = if (list == 0) addr +% (if (U) @as(u32, 0x40) else @as(u32, 0) -% 0x40) else end_addr;
             if (W) {
-                cpu.r[rn] = end_addr;
+                cpu.r[rn] = base_new;
                 if (rn == 15) cpu.reloadPipeline();
             }
 
-            // NBA: bus.Idle() after a load (LDM/LDR/LDRH alike).
+            // Restore mode if we switched to user.
+            if (switch_mode) cpu.switchMode(@enumFromInt(mode_save));
+
             if (L) cpu.bus.wait_cycles_accum +%= 1;
         }
     }.handler;

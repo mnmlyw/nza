@@ -40,16 +40,28 @@ pub const SRAM_SIZE: u32 = 0x10000;
 pub const FLASH128_SIZE: u32 = 0x20000;
 pub const ROM_MAX_SIZE: u32 = 0x02000000; // 32 MB per bank, three banks total
 
+/// NBA-style prefetch buffer state. The cart bus speculatively
+/// pre-fetches sequential opcodes into a small FIFO while the CPU
+/// is busy on non-ROM work. A code fetch that hits the FIFO costs
+/// 1 cycle instead of the full S-cycle.
 pub const Prefetch = struct {
     enabled: bool = false,
+    active: bool = false,
     count: u8 = 0,
-    capacity: u8 = 8,
-    /// Cycles before next prefetched word arrives. Negative = ready
-    /// to push (clamped at the cap of `capacity`).
-    pending: i32 = 0,
-    /// ROM S-cycle count for the current waitstate region. Updated
-    /// on WAITCNT writes via `applyWaitCnt`.
-    ws_s_cycles: u8 = 2,
+    capacity: u8 = 8, // 8 for Thumb, 4 for ARM
+    /// Cycles before next prefetched word arrives.
+    countdown: i32 = 0,
+    /// S-cycle cost per opcode at the active region.
+    duty: u8 = 2,
+    /// Thumb mode at last refill.
+    thumb: bool = false,
+    /// 2 for Thumb, 4 for ARM.
+    opcode_width: u8 = 2,
+    /// Next address the prefetch unit will pull from cart-ROM.
+    last_address: u32 = 0,
+    /// Address of the first opcode currently in the buffer (the
+    /// next one the CPU would consume on a hit).
+    head_address: u32 = 0,
 };
 
 pub const Bus = struct {
@@ -328,13 +340,13 @@ pub const Bus = struct {
         } else if (self.prefetch.enabled and is_rom) {
             // ROM data access or pipeline-refill nonseq: flush buffer.
             self.prefetch.count = 0;
-            self.prefetch.pending = self.prefetch.ws_s_cycles;
+            self.prefetch.countdown = self.prefetch.duty;
         } else if (self.prefetch.enabled and !is_rom) {
             // Non-ROM access: step prefetch forward by this access's cost.
-            self.prefetch.pending -= @as(i32, raw_cost);
-            while (self.prefetch.pending <= 0 and self.prefetch.count < self.prefetch.capacity) {
+            self.prefetch.countdown -= @as(i32, raw_cost);
+            while (self.prefetch.countdown <= 0 and self.prefetch.count < self.prefetch.capacity) {
                 self.prefetch.count += 1;
-                self.prefetch.pending += @as(i32, self.prefetch.ws_s_cycles);
+                self.prefetch.countdown += @as(i32, self.prefetch.duty);
             }
         }
 
@@ -403,7 +415,7 @@ pub const Bus = struct {
             self.prefetch.enabled = prefetch_on;
             self.prefetch.count = 0;
         }
-        self.prefetch.ws_s_cycles = ws0_s;
+        self.prefetch.duty = ws0_s;
     }
 };
 
