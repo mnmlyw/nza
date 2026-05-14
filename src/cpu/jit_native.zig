@@ -87,6 +87,14 @@ pub const Emitter = struct {
         self.write(0x52800000 | (@as(u32, imm16) << 5) | @as(u32, wd));
     }
 
+    /// MOVK Wd, #imm16, LSL #shift — keep other halves intact.
+    /// Encoding: `0x72800000 | (hw << 21) | (imm16 << 5) | Wd`, where
+    /// hw = shift / 16 (0 or 1 for 32-bit).
+    pub fn movkW(self: *Emitter, wd: u5, imm16: u16, shift: u5) void {
+        const hw: u32 = shift / 16;
+        self.write(0x72800000 | (hw << 21) | (@as(u32, imm16) << 5) | @as(u32, wd));
+    }
+
     /// STR Wt, [Xn, #imm12*4] — unsigned-offset store of a 32-bit value.
     /// Encoding: `0xB9000000 | ((imm12) << 10) | (Xn << 5) | Wt`.
     pub fn strWImmU(self: *Emitter, wt: u5, xn: u5, byte_off: u14) void {
@@ -113,15 +121,25 @@ pub fn translateArm(em: *Emitter, instr: u32) bool {
         const rd: u4 = @intCast((instr >> 12) & 0xF);
         const rotate: u4 = @intCast((instr >> 8) & 0xF);
         const imm_field: u32 = instr & 0xFF;
-        // Only handle: MOV (opcode=1101), no flags, no rotate, Rd != PC.
-        if (opcode == 0b1101 and !set_flags and rotate == 0 and rd < 15) {
-            // r_offset within Cpu struct: Zig may reorder fields, so
-            // ask @offsetOf at comptime rather than assuming 0.
-            const r_base: u14 = comptime @intCast(@offsetOf(Cpu, "r"));
-            const off: u14 = r_base + @as(u14, rd) * 4;
-            em.movzW(1, @intCast(imm_field));
-            em.strWImmU(1, 0, off);
-            return true;
+        // We only handle: no flags, no rotate, Rd != PC, imm fits u16.
+        if (set_flags or rotate != 0 or rd == 15 or imm_field > 0xFFFF) return false;
+
+        const r_base: u14 = comptime @intCast(@offsetOf(Cpu, "r"));
+        const off: u14 = r_base + @as(u14, rd) * 4;
+
+        switch (opcode) {
+            0b1101 => { // MOV Rd, #imm
+                em.movzW(1, @intCast(imm_field));
+                em.strWImmU(1, 0, off);
+                return true;
+            },
+            0b1111 => { // MVN Rd, #imm  (Rd = ~imm)
+                em.movzW(1, @intCast(imm_field ^ 0xFFFF)); // low 16 bits inverted
+                em.movkW(1, 0xFFFF, 16); // upper 16 bits all-ones
+                em.strWImmU(1, 0, off);
+                return true;
+            },
+            else => return false,
         }
     }
     return false;
@@ -173,4 +191,20 @@ test "JIT refuses unsupported instructions" {
     // ARM: SUB r0, r1, r2 (data-proc register, not immediate)
     const fn_ptr = compileSingle(&page, 0xE041_0002);
     try std.testing.expect(fn_ptr == null);
+}
+
+test "JIT compiles ARM MVN r3, #0 and executes" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return;
+    var page = CodePage.alloc() orelse return;
+    defer page.free();
+
+    // ARM: MVN r3, #0 → cond=E, op=001, opcode=1111, S=0, Rd=3, rot=0, imm=0
+    // Should set r[3] = ~0 = 0xFFFFFFFF.
+    // Encoding: 1110_0011_1110_0000_0011_0000_0000_0000 = 0xE3E0_3000
+    const fn_ptr = compileSingle(&page, 0xE3E0_3000) orelse return error.JitNotSupported;
+    var bus: @import("../core/bus.zig").Bus = .{};
+    var cpu = Cpu.init(&bus);
+    cpu.r[3] = 0x1234;
+    fn_ptr(&cpu);
+    try std.testing.expectEqual(@as(u32, 0xFFFF_FFFF), cpu.r[3]);
 }
