@@ -40,6 +40,18 @@ pub const SRAM_SIZE: u32 = 0x10000;
 pub const FLASH128_SIZE: u32 = 0x20000;
 pub const ROM_MAX_SIZE: u32 = 0x02000000; // 32 MB per bank, three banks total
 
+pub const Prefetch = struct {
+    enabled: bool = false,
+    count: u8 = 0,
+    capacity: u8 = 8,
+    /// Cycles before next prefetched word arrives. Negative = ready
+    /// to push (clamped at the cap of `capacity`).
+    pending: i32 = 0,
+    /// ROM S-cycle count for the current waitstate region. Updated
+    /// on WAITCNT writes via `applyWaitCnt`.
+    ws_s_cycles: u8 = 2,
+};
+
 pub const Bus = struct {
     bios: [BIOS_SIZE]u8 = std.mem.zeroes([BIOS_SIZE]u8),
     wram: [WRAM_SIZE]u8 = std.mem.zeroes([WRAM_SIZE]u8),
@@ -64,6 +76,12 @@ pub const Bus = struct {
     /// PRAM/VRAM/OAM during H-draw stall an additional cycle because PPU
     /// is contending for the same bus.
     ppu_in_hdraw: bool = false,
+
+    /// Cart-ROM prefetch buffer state. Enabled via WAITCNT.14. While
+    /// the CPU does non-ROM work, the cart bus speculatively prefetches
+    /// sequential ROM words; a subsequent code fetch hits the buffer at
+    /// 1-cycle cost instead of the full S-cycle.
+    prefetch: Prefetch = .{},
 
     io: io_mod.Io = .{},
 
@@ -263,10 +281,32 @@ pub const Bus = struct {
 
     inline fn billCycles(self: *Bus, comptime T: type, region: u32, access: Access) void {
         const idx: usize = if (access == .nonseq) 0 else 1;
-        const cost: u8 = if (@typeInfo(T).int.bits == 32)
+        const raw_cost: u8 = if (@typeInfo(T).int.bits == 32)
             self.wait32[region][idx]
         else
             self.wait16[region][idx];
+
+        const is_rom = region >= 0x8 and region <= 0xD;
+        var cost: u8 = raw_cost;
+
+        // Prefetch buffer fast path: sequential code fetch from cart ROM
+        // can be served from the FIFO at 1 cycle cost.
+        if (self.prefetch.enabled and is_rom and access == .seq and self.prefetch.count > 0) {
+            cost = 1;
+            self.prefetch.count -= 1;
+        } else if (self.prefetch.enabled and is_rom) {
+            // ROM data access or pipeline-refill nonseq: flush buffer.
+            self.prefetch.count = 0;
+            self.prefetch.pending = self.prefetch.ws_s_cycles;
+        } else if (self.prefetch.enabled and !is_rom) {
+            // Non-ROM access: step prefetch forward by this access's cost.
+            self.prefetch.pending -= @as(i32, raw_cost);
+            while (self.prefetch.pending <= 0 and self.prefetch.count < self.prefetch.capacity) {
+                self.prefetch.count += 1;
+                self.prefetch.pending += @as(i32, self.prefetch.ws_s_cycles);
+            }
+        }
+
         self.wait_cycles_accum +%= cost;
         // PPU bus contention: CPU touching PRAM/VRAM/OAM during H-draw
         // stalls 1 cycle (2 for 32-bit access to PRAM/VRAM).
@@ -324,6 +364,15 @@ pub const Bus = struct {
         self.wait16[0xF] = self.wait16[0xE];
         self.wait32[0xE] = self.wait16[0xE];
         self.wait32[0xF] = self.wait16[0xE];
+
+        // Prefetch buffer enable (WAITCNT.14). Use WS0 S-cycle as the
+        // representative refill rate — most games execute from WS0.
+        const prefetch_on = (w & (1 << 14)) != 0;
+        if (prefetch_on != self.prefetch.enabled) {
+            self.prefetch.enabled = prefetch_on;
+            self.prefetch.count = 0;
+        }
+        self.prefetch.ws_s_cycles = ws0_s;
     }
 };
 
