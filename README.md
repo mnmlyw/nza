@@ -29,9 +29,15 @@ house with correct rendering and audio.
 | M4.4 | Link cable multiplayer over TCP between two nza instances | done |
 | M4.5 | Wireless adapter coverage (FR/LG fall-back via SIO stub) | done |
 | M4.6 | JIT block-cache scaffold (basic-block discovery, code cache) | done |
-| M4.7 | JIT native AArch64 emitter (MOV / MVN immediate) — real machine code | done |
+| M4.7 | JIT native AArch64 emitter — full ARM + Thumb coverage via interpreter fallback | done |
 
-~8400 LOC. 58/58 unit tests + 4/4 integration tests passing.
+~8700 LOC. 60/60 unit tests + 4/4 integration tests passing.
+
+**JIT coverage**: every ARM and Thumb instruction can flow through
+the JIT. Hot opcodes get native AArch64 translation (today: MOV imm
+and MVN imm); everything else emits a BLR to a C-ABI trampoline
+that dispatches through the interpreter handler. The same pattern
+NBA uses, just with fewer specialized translations so far.
 
 ## What works
 
@@ -78,12 +84,10 @@ house with correct rendering and audio.
   - `memory.gba` test 050 — unaligned LDR/LDM rotation edge
 - **Some Pokémon audio specifics.** M4A song-transition stall still open
   (task #12). PSG channel 3 wave pattern bank-switch edge case.
-- **JIT recompiler — instruction coverage.** The framework is in
-  (mmap'd JIT page + AArch64 emitter + block cache), and 2 ARM
-  instruction classes translate end-to-end. Expanding to full
-  coverage is incremental work; the interpreter already runs
-  Pokémon Emerald >2× real-time on an M1 Mac, so this is throughput
-  optimization rather than a missing feature.
+- **JIT speedup.** The JIT compiles and runs every ARM+Thumb
+  instruction, but only MOV/MVN immediate currently bypass the
+  interpreter — adding more native translations for hot opcodes
+  is incremental performance work, not a behavior gap.
 - **Three jsmolka instruction-level failures** (see top of "What
   doesn't"). Don't block any commercial game.
 - **GamePak DRQ / Video Capture special-DMA** — niche corner cases.
