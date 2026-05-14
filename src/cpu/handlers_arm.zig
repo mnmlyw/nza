@@ -432,6 +432,8 @@ pub fn singleDataTransferHandler(comptime top: u8, comptime low: u4) decode.ArmF
                     const rot: u5 = @intCast((addr & 3) * 8);
                     break :blk std.math.rotr(u32, raw, rot);
                 };
+                // NBA: bus.Idle() after every LDR load (1 I-cycle).
+                cpu.bus.wait_cycles_accum +%= 1;
                 cpu.r[rd] = value;
                 if (rd == 15) cpu.reloadPipeline();
             } else {
@@ -569,6 +571,9 @@ pub fn blockTransferHandler(comptime top: u8) decode.ArmFn {
                 cpu.r[rn] = end_addr;
                 if (rn == 15) cpu.reloadPipeline();
             }
+
+            // NBA: bus.Idle() after a load (LDM/LDR/LDRH alike).
+            if (L) cpu.bus.wait_cycles_accum +%= 1;
         }
     }.handler;
 }
@@ -673,6 +678,8 @@ pub fn halfwordTransferHandler(comptime top: u8, comptime sh: u2) decode.ArmFn {
                     },
                     else => unreachable, // sh=0 is SWP (handled elsewhere)
                 };
+                // NBA: bus.Idle() after every halfword/signed load.
+                cpu.bus.wait_cycles_accum +%= 1;
                 if (rd == 15) cpu.reloadPipeline();
             } else if (sh == 1) {
                 // STRH only. sh=2,3 store forms are not used by ARM7TDMI / GBA.

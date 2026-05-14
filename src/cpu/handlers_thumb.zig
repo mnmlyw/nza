@@ -368,6 +368,7 @@ pub fn pcRelLoad(cpu: *Cpu, instr: u16) void {
     // r[15] at execute = instr_addr + 4 (ARM ARM Thumb PC). Word-align for the load.
     const base = cpu.r[15] & ~@as(u32, 3);
     cpu.r[rd] = cpu.bus.read(u32, base +% offset);
+    cpu.bus.wait_cycles_accum +%= 1; // NBA: bus.Idle() after load
 }
 
 // =====================================================================
@@ -389,8 +390,12 @@ pub fn loadStoreRegHandler(comptime op: u2) decode.ThumbFn {
                     const raw = cpu.bus.read(u32, aligned);
                     const rot: u5 = @intCast((addr & 3) * 8);
                     cpu.r[rd] = std.math.rotr(u32, raw, rot);
+                    cpu.bus.wait_cycles_accum +%= 1;
                 },
-                3 => cpu.r[rd] = cpu.bus.read(u8, addr), // LDRB
+                3 => { // LDRB
+                    cpu.r[rd] = cpu.bus.read(u8, addr);
+                    cpu.bus.wait_cycles_accum +%= 1;
+                },
             }
         }
     }.handler;
@@ -412,6 +417,7 @@ pub fn loadStoreSignExtHandler(comptime op: u2) decode.ThumbFn {
                 1 => { // LDSB
                     const b = cpu.bus.read(u8, addr);
                     cpu.r[rd] = @bitCast(@as(i32, @as(i8, @bitCast(b))));
+                    cpu.bus.wait_cycles_accum +%= 1;
                 },
                 2 => { // LDRH
                     const aligned = addr & ~@as(u32, 1);
@@ -420,6 +426,7 @@ pub fn loadStoreSignExtHandler(comptime op: u2) decode.ThumbFn {
                         // Unaligned LDRH rotates by 8 (ARM7TDMI quirk).
                         cpu.r[rd] = std.math.rotr(u32, @as(u32, raw), 8);
                     } else cpu.r[rd] = raw;
+                    cpu.bus.wait_cycles_accum +%= 1;
                 },
                 3 => { // LDSH
                     if ((addr & 1) != 0) {
@@ -430,6 +437,7 @@ pub fn loadStoreSignExtHandler(comptime op: u2) decode.ThumbFn {
                         const h = cpu.bus.read(u16, addr);
                         cpu.r[rd] = @bitCast(@as(i32, @as(i16, @bitCast(h))));
                     }
+                    cpu.bus.wait_cycles_accum +%= 1;
                 },
             }
         }
@@ -459,9 +467,13 @@ pub fn loadStoreImmHandler(comptime op: u2) decode.ThumbFn {
                     const raw = cpu.bus.read(u32, aligned);
                     const rot: u5 = @intCast((addr & 3) * 8);
                     cpu.r[rd] = std.math.rotr(u32, raw, rot);
+                    cpu.bus.wait_cycles_accum +%= 1;
                 },
                 2 => cpu.bus.write(u8, addr, @truncate(cpu.r[rd])), // STRB
-                3 => cpu.r[rd] = cpu.bus.read(u8, addr), // LDRB
+                3 => { // LDRB
+                    cpu.r[rd] = cpu.bus.read(u8, addr);
+                    cpu.bus.wait_cycles_accum +%= 1;
+                },
             }
         }
     }.handler;
@@ -484,6 +496,7 @@ pub fn loadStoreHalfHandler(comptime is_load: bool) decode.ThumbFn {
                 if ((addr & 1) != 0) {
                     cpu.r[rd] = std.math.rotr(u32, @as(u32, raw), 8);
                 } else cpu.r[rd] = raw;
+                cpu.bus.wait_cycles_accum +%= 1;
             } else {
                 cpu.bus.write(u16, addr & ~@as(u32, 1), @truncate(cpu.r[rd]));
             }
@@ -506,6 +519,7 @@ pub fn spRelHandler(comptime is_load: bool) decode.ThumbFn {
                 const raw = cpu.bus.read(u32, aligned);
                 const rot: u5 = @intCast((addr & 3) * 8);
                 cpu.r[rd] = std.math.rotr(u32, raw, rot);
+                cpu.bus.wait_cycles_accum +%= 1;
             } else {
                 cpu.bus.write(u32, addr & ~@as(u32, 3), cpu.r[rd]);
             }
@@ -583,6 +597,7 @@ pub fn pushPopHandler(comptime is_pop: bool, comptime has_lr_pc: bool) decode.Th
                     cpu.reloadPipeline();
                 }
                 cpu.r[13] = sp;
+                cpu.bus.wait_cycles_accum +%= 1; // NBA: bus.Idle() after POP load
             }
         }
     }.handler;
@@ -622,6 +637,7 @@ pub fn multipleLoadStoreHandler(comptime is_load: bool) decode.ThumbFn {
             // Writeback unless LDM with rb in list (loaded value wins).
             const rb_in_list = ((rlist >> @intCast(rb)) & 1) != 0;
             if (!(is_load and rb_in_list)) cpu.r[rb] = addr;
+            if (is_load) cpu.bus.wait_cycles_accum +%= 1; // NBA: bus.Idle()
         }
     }.handler;
 }
