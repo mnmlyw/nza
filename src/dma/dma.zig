@@ -63,6 +63,17 @@ pub const Dma = struct {
             ch.count = countOf(idx, cnt_l);
             ch.count_latch = ch.count;
             ch.special_words_transferred = 0;
+            // EEPROM size detection on DMA3 transfers into the EEPROM
+            // window. The first DMA's transfer count tells us 4K vs 64K.
+            if (idx == 3) {
+                if (self.bus.eeprom) |e| {
+                    const dst_region = (ch.dad >> 24) & 0xF;
+                    const src_region = (ch.sad >> 24) & 0xF;
+                    if (dst_region == 0xD or src_region == 0xD) {
+                        e.announceDmaCount(ch.count);
+                    }
+                }
+            }
             if (timingOf(new_cnt) == .immediate) self.run(idx);
         }
     }

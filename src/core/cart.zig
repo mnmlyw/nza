@@ -26,6 +26,8 @@ pub const Cartridge = struct {
     rom: []u8,
     save_type: SaveType,
     title: [12]u8,
+    game_code: [4]u8,
+    save_path: ?[]u8 = null,
 
     pub fn loadFile(allocator: std.mem.Allocator, path: []const u8) !Cartridge {
         const rom = try file_util.readAllAlloc(allocator, path, MAX_ROM_SIZE);
@@ -35,16 +37,26 @@ pub const Cartridge = struct {
         var title: [12]u8 = undefined;
         @memcpy(&title, rom[0xA0..0xAC]);
 
+        var game_code: [4]u8 = undefined;
+        @memcpy(&game_code, rom[0xAC..0xB0]);
+
+        const save_file = @import("save_file.zig");
+        const save_path = save_file.savePathFor(allocator, path) catch null;
+
         return .{
             .rom = rom,
             .save_type = detectSaveType(rom),
             .title = title,
+            .game_code = game_code,
+            .save_path = save_path,
         };
     }
 
     pub fn deinit(self: *Cartridge, allocator: std.mem.Allocator) void {
         allocator.free(self.rom);
         self.rom = &.{};
+        if (self.save_path) |p| allocator.free(p);
+        self.save_path = null;
     }
 };
 

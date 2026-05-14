@@ -27,6 +27,7 @@
 const std = @import("std");
 const io_mod = @import("io.zig");
 const flash_mod = @import("flash.zig");
+const eeprom_mod = @import("eeprom.zig");
 
 pub const BIOS_SIZE: u32 = 0x4000;
 pub const WRAM_SIZE: u32 = 0x40000;
@@ -45,11 +46,17 @@ pub const Bus = struct {
     pram: [PRAM_SIZE]u8 = std.mem.zeroes([PRAM_SIZE]u8),
     vram: [VRAM_SIZE]u8 = std.mem.zeroes([VRAM_SIZE]u8),
     oam: [OAM_SIZE]u8 = std.mem.zeroes([OAM_SIZE]u8),
-    sram: [SRAM_SIZE]u8 = std.mem.zeroes([SRAM_SIZE]u8),
+    sram: [SRAM_SIZE]u8 = [_]u8{0xFF} ** SRAM_SIZE,
     flash_data: [FLASH128_SIZE]u8 = [_]u8{0xFF} ** FLASH128_SIZE,
     flash: ?flash_mod.Flash = null,
+    eeprom: ?*eeprom_mod.Eeprom = null,
+    /// True when the cart uses EEPROM and its bus window is the narrow
+    /// 0x0DFFFF00..0x0DFFFFFF range (= ROM > 16 MB). Otherwise EEPROM
+    /// occupies all of region 0xD.
+    eeprom_narrow_window: bool = false,
     rom: []const u8 = &.{},
     gpio_enabled: bool = false,
+    save_dirty: bool = false,
 
     io: io_mod.Io = .{},
 
@@ -95,7 +102,7 @@ pub const Bus = struct {
             0x5 => readSlice(T, self.pram[0..], addr & (PRAM_SIZE - 1)),
             0x6 => readSlice(T, self.vram[0..], vramAddr(addr)),
             0x7 => readSlice(T, self.oam[0..], addr & (OAM_SIZE - 1)),
-            0x8, 0x9, 0xA, 0xB, 0xC, 0xD => self.readRom(T, addr & 0x01FF_FFFF),
+            0x8, 0x9, 0xA, 0xB, 0xC, 0xD => self.readRomRegion(T, addr, region),
             0xE, 0xF => self.readBackup(T, addr & (SRAM_SIZE - 1)),
             else => openBus(T, self.last_code_fetch, addr),
         };
@@ -120,18 +127,46 @@ pub const Bus = struct {
             0x5 => writeSlice(T, self.pram[0..], addr & (PRAM_SIZE - 1), value),
             0x6 => writeSlice(T, self.vram[0..], vramAddr(addr), value),
             0x7 => writeSlice(T, self.oam[0..], addr & (OAM_SIZE - 1), value),
-            0x8, 0x9, 0xA, 0xB, 0xC, 0xD => {
-                // Cart GPIO control: bit 0 of byte at 0x080000C8 toggles
-                // GPIO read-back mode. Pokemon Emerald enables this to read
-                // its RTC chip; we don't model RTC, just enable the gating.
-                const rom_addr = addr & 0x01FF_FFFF;
-                if (rom_addr == 0xC8) {
-                    self.gpio_enabled = (@as(u32, @intCast(value)) & 1) != 0;
-                }
-            },
+            0x8, 0x9, 0xA, 0xB, 0xC, 0xD => self.writeRomRegion(T, addr, region, value),
             0xE, 0xF => self.writeBackup(T, addr & (SRAM_SIZE - 1), value),
             else => {},
         }
+    }
+
+    fn readRomRegion(self: *Bus, comptime T: type, addr: u32, region: u32) T {
+        // EEPROM window in region 0xD (or 0x0DFFFF00..0xDFFFFFFF when ROM > 16 MB).
+        if (self.eeprom) |e| {
+            if (region == 0xD and self.eepromHits(addr)) {
+                const bit: T = @intCast(e.readBit() & 1);
+                return bit;
+            }
+        }
+        return self.readRom(T, addr & 0x01FF_FFFF);
+    }
+
+    fn writeRomRegion(self: *Bus, comptime T: type, addr: u32, region: u32, value: T) void {
+        // EEPROM bit-stream writes via DMA3.
+        if (self.eeprom) |e| {
+            if (region == 0xD and self.eepromHits(addr)) {
+                e.writeBit(@intCast(value & 1));
+                self.save_dirty = true;
+                return;
+            }
+        }
+        // Cart GPIO control: bit 0 of byte at 0x080000C8 toggles
+        // GPIO read-back mode. Pokemon Emerald enables this to read
+        // its RTC chip; M3.3 replaces this with proper GPIO.
+        const rom_addr = addr & 0x01FF_FFFF;
+        if (rom_addr == 0xC8) {
+            self.gpio_enabled = (@as(u32, @intCast(value)) & 1) != 0;
+        }
+    }
+
+    inline fn eepromHits(self: *const Bus, addr: u32) bool {
+        if (self.eeprom_narrow_window) {
+            return (addr & 0x01FF_FF00) == 0x01FF_FF00;
+        }
+        return true;
     }
 
     fn readRom(self: *Bus, comptime T: type, rom_addr: u32) T {
@@ -183,6 +218,7 @@ pub const Bus = struct {
         } else {
             self.sram[sram_addr] = b;
         }
+        self.save_dirty = true;
     }
 
     inline fn billCycles(self: *Bus, comptime T: type, region: u32, access: Access) void {

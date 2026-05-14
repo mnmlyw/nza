@@ -9,6 +9,8 @@ const Cpu = @import("../cpu/arm7tdmi.zig").Cpu;
 const cart = @import("cart.zig");
 const bios = @import("bios.zig");
 const flash_mod = @import("flash.zig");
+const eeprom_mod = @import("eeprom.zig");
+const save_file = @import("save_file.zig");
 const Irq = @import("../irq/irq.zig").Irq;
 const Keypad = @import("../keypad/keypad.zig").Keypad;
 const Ppu = @import("../ppu/ppu.zig").Ppu;
@@ -32,7 +34,9 @@ pub const Core = struct {
     timers: Timers,
     apu: Apu,
     cart: ?cart.Cartridge = null,
+    eeprom: ?eeprom_mod.Eeprom = null,
     irq_entry_count: u64 = 0,
+    frames_run: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) !*Core {
         const self = try allocator.create(Core);
@@ -70,6 +74,7 @@ pub const Core = struct {
     }
 
     pub fn deinit(self: *Core) void {
+        self.flushSaveIfDirty();
         if (self.cart) |*c| c.deinit(self.allocator);
         self.allocator.destroy(self);
     }
@@ -92,6 +97,58 @@ pub const Core = struct {
             .flash_128k => flash_mod.Flash.init(.kb128, self.bus.flash_data[0..]),
             else => null,
         };
+        // EEPROM lives in ROM-space; allocate the state machine when the
+        // ROM scan said so. Window narrows on ROMs > 16 MB.
+        if (self.cart.?.save_type == .eeprom) {
+            self.eeprom = .{};
+            self.bus.eeprom = &self.eeprom.?;
+            self.bus.eeprom_narrow_window = self.bus.rom.len > 0x0100_0000;
+        } else {
+            self.bus.eeprom = null;
+        }
+        // Load any persisted .sav file. mGBA/VBA/NBA-compatible format:
+        // raw chip contents, no header. Size disambiguates type.
+        if (self.cart.?.save_path) |p| {
+            switch (self.cart.?.save_type) {
+                .sram => _ = save_file.loadInto(p, self.bus.sram[0..], 0xFF),
+                .flash_64k => _ = save_file.loadInto(p, self.bus.flash_data[0..0x10000], 0xFF),
+                .flash_128k => _ = save_file.loadInto(p, self.bus.flash_data[0..], 0xFF),
+                .eeprom => {
+                    // We don't yet know 4K vs 64K. Load the largest file we
+                    // can; the EEPROM state machine reads from the same
+                    // backing buffer regardless of size.
+                    _ = save_file.loadInto(p, self.eeprom.?.data[0..], 0xFF);
+                },
+                .none => {},
+            }
+        }
+        self.bus.save_dirty = false;
+    }
+
+    /// Flush dirty backup chip bytes to `<rom>.sav`. Called at frame end
+    /// (when dirty) and on `deinit`.
+    pub fn flushSaveIfDirty(self: *Core) void {
+        if (!self.bus.save_dirty) return;
+        if (self.cart == null) return;
+        const c = &self.cart.?;
+        const p = c.save_path orelse return;
+        const eep_dirty = if (self.eeprom) |*e| e.dirty else false;
+        const slice: ?[]const u8 = switch (c.save_type) {
+            .sram => self.bus.sram[0..],
+            .flash_64k => self.bus.flash_data[0..0x10000],
+            .flash_128k => self.bus.flash_data[0..],
+            .eeprom => if (self.eeprom) |*e| e.data[0..e.capacity()] else null,
+            .none => null,
+        };
+        if (slice) |bytes| {
+            save_file.flush(self.allocator, p, bytes) catch |err| {
+                std.debug.print("[save] flush failed: {s}\n", .{@errorName(err)});
+            };
+        }
+        self.bus.save_dirty = false;
+        if (eep_dirty) {
+            if (self.eeprom) |*e| e.dirty = false;
+        }
     }
 
     /// Skip the BIOS boot sequence and jump straight to the cartridge entry
@@ -185,6 +242,10 @@ pub const Core = struct {
 
             self.cpu.step();
             self.scheduler.addCycles(self.cpu.cycles);
+        }
+        self.frames_run += 1;
+        if (self.frames_run % 60 == 0 and self.bus.save_dirty) {
+            self.flushSaveIfDirty();
         }
     }
 };
