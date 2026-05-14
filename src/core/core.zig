@@ -10,6 +10,7 @@ const cart = @import("cart.zig");
 const bios = @import("bios.zig");
 const flash_mod = @import("flash.zig");
 const eeprom_mod = @import("eeprom.zig");
+const gpio_mod = @import("gpio.zig");
 const save_file = @import("save_file.zig");
 const snapshot = @import("snapshot.zig");
 const ppu_mod = @import("../ppu/ppu.zig");
@@ -39,6 +40,7 @@ pub const Core = struct {
     apu: Apu,
     cart: ?cart.Cartridge = null,
     eeprom: ?eeprom_mod.Eeprom = null,
+    gpio: ?gpio_mod.Gpio = null,
     irq_entry_count: u64 = 0,
     frames_run: u64 = 0,
 
@@ -224,6 +226,15 @@ pub const Core = struct {
             self.bus.eeprom_narrow_window = self.bus.rom.len > 0x0100_0000;
         } else {
             self.bus.eeprom = null;
+        }
+        // Detect cart GPIO device (RTC / solar / rumble) by gamecode.
+        const dev = gpio_mod.detect(self.cart.?.game_code);
+        if (dev != .none) {
+            self.gpio = .{ .device = dev };
+            self.bus.gpio = &self.gpio.?;
+        } else {
+            self.gpio = null;
+            self.bus.gpio = null;
         }
         // Load any persisted .sav file. mGBA/VBA/NBA-compatible format:
         // raw chip contents, no header. Size disambiguates type.

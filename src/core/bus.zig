@@ -28,6 +28,7 @@ const std = @import("std");
 const io_mod = @import("io.zig");
 const flash_mod = @import("flash.zig");
 const eeprom_mod = @import("eeprom.zig");
+const gpio_mod = @import("gpio.zig");
 
 pub const BIOS_SIZE: u32 = 0x4000;
 pub const WRAM_SIZE: u32 = 0x40000;
@@ -56,6 +57,7 @@ pub const Bus = struct {
     eeprom_narrow_window: bool = false,
     rom: []const u8 = &.{},
     gpio_enabled: bool = false,
+    gpio: ?*gpio_mod.Gpio = null,
     save_dirty: bool = false,
 
     io: io_mod.Io = .{},
@@ -153,12 +155,36 @@ pub const Bus = struct {
                 return;
             }
         }
-        // Cart GPIO control: bit 0 of byte at 0x080000C8 toggles
-        // GPIO read-back mode. Pokemon Emerald enables this to read
-        // its RTC chip; M3.3 replaces this with proper GPIO.
         const rom_addr = addr & 0x01FF_FFFF;
-        if (rom_addr == 0xC8) {
-            self.gpio_enabled = (@as(u32, @intCast(value)) & 1) != 0;
+        // Cart GPIO at 0x080000C4..0xC8.
+        if (rom_addr >= 0xC4 and rom_addr <= 0xC9) {
+            if (self.gpio) |g| {
+                const bits = @typeInfo(T).int.bits;
+                if (bits == 16) {
+                    g.write(rom_addr & 0xFE, @intCast(value));
+                } else if (bits == 8) {
+                    // Update only the byte in question by reading current.
+                    const reg_off = rom_addr & 0xFE;
+                    var cur = g.read(reg_off);
+                    if ((rom_addr & 1) == 0) {
+                        cur = (cur & 0xFF00) | @as(u16, @intCast(value));
+                    } else {
+                        cur = (cur & 0x00FF) | (@as(u16, @intCast(value)) << 8);
+                    }
+                    g.write(reg_off, cur);
+                } else if (bits == 32) {
+                    g.write(rom_addr & 0xFE, @truncate(value));
+                    g.write((rom_addr & 0xFE) + 2, @truncate(value >> 16));
+                }
+                if (rom_addr == 0xC8 or rom_addr == 0xC9) {
+                    self.gpio_enabled = (g.control & 1) != 0;
+                }
+                return;
+            }
+            // No GPIO chip configured: keep legacy gating bit so old saves still boot.
+            if (rom_addr == 0xC8) {
+                self.gpio_enabled = (@as(u32, @intCast(value)) & 1) != 0;
+            }
         }
     }
 
@@ -171,13 +197,22 @@ pub const Bus = struct {
 
     fn readRom(self: *Bus, comptime T: type, rom_addr: u32) T {
         // Cart GPIO (RTC etc.) sits in ROM-space at 0x080000C4..0xC9. When
-        // a game enables GPIO read mode by writing to 0x080000C8 control,
-        // reads here return GPIO data; otherwise they pass through to ROM.
-        // We don't model GPIO/RTC: return 0 for the data port so Pokemon
-        // Emerald sees "RTC stuck low" and falls back to no-RTC handling
-        // rather than reading garbage ROM bytes.
-        if (self.gpio_enabled and rom_addr >= 0xC4 and rom_addr <= 0xC9) {
-            return 0;
+        // enabled, reads here return GPIO data. With no GPIO chip wired,
+        // return 0 (older behavior).
+        if (rom_addr >= 0xC4 and rom_addr <= 0xC9) {
+            if (self.gpio) |g| {
+                if ((g.control & 1) != 0) {
+                    const v: u16 = g.read(rom_addr & 0xFE);
+                    return switch (@typeInfo(T).int.bits) {
+                        8 => @intCast(v & 0xFF),
+                        16 => @intCast(v),
+                        32 => @intCast(@as(u32, v)),
+                        else => unreachable,
+                    };
+                }
+            } else if (self.gpio_enabled) {
+                return 0;
+            }
         }
         if (rom_addr + (@typeInfo(T).int.bits / 8) <= self.rom.len) {
             return readSlice(T, self.rom, rom_addr);

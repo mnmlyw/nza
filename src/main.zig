@@ -368,6 +368,7 @@ test {
     _ = @import("core/core.zig");
     _ = @import("core/flash.zig");
     _ = @import("core/eeprom.zig");
+    _ = @import("core/gpio.zig");
     _ = @import("core/snapshot.zig");
     _ = @import("frontend/config.zig");
     _ = @import("apu/apu.zig");
