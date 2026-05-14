@@ -632,6 +632,40 @@ pub fn mulLongHandler(comptime uas: u3) decode.ArmFn {
 }
 
 // =====================================================================
+// Single Data Swap (SWP, SWPB)
+// =====================================================================
+
+pub fn swpHandler(comptime byte: bool) decode.ArmFn {
+    return struct {
+        fn handler(cpu: *Cpu, instr: u32) void {
+            const src: u4 = @intCast(instr & 0xF);
+            const dst: u4 = @intCast((instr >> 12) & 0xF);
+            const base: u4 = @intCast((instr >> 16) & 0xF);
+            // NBA: state.r15 += 4 prologue.
+            cpu.r[15] +%= 4;
+            cpu.branched = true;
+            const addr = cpu.r[base];
+            const tmp: u32 = if (byte)
+                @as(u32, cpu.bus.read(u8, addr))
+            else blk: {
+                const aligned = addr & ~@as(u32, 3);
+                const raw = cpu.bus.read(u32, aligned);
+                const rot: u5 = @intCast((addr & 3) * 8);
+                break :blk std.math.rotr(u32, raw, rot);
+            };
+            if (byte) {
+                cpu.bus.write(u8, addr, @truncate(cpu.r[src]));
+            } else {
+                cpu.bus.write(u32, addr & ~@as(u32, 3), cpu.r[src]);
+            }
+            cpu.bus.wait_cycles_accum +%= 1; // bus.Idle()
+            cpu.r[dst] = tmp;
+            if (dst == 15) cpu.reloadPipeline();
+        }
+    }.handler;
+}
+
+// =====================================================================
 // Halfword & signed transfer (LDRH, STRH, LDRSB, LDRSH)
 // =====================================================================
 

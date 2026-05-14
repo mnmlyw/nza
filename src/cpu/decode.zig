@@ -85,8 +85,9 @@ fn resolveArm(comptime hash: u12) ArmFn {
                         // Multiply long (UMULL/UMLAL/SMULL/SMLAL). top = 0000_1_UAS.
                         return comptime arm_handlers.mulLongHandler(@as(u3, @intCast(top & 0b0111)));
                     }
-                    // SWP / SWPB occupies top = 0001_0000 / 0001_0100, low = 0b1001.
-                    // Deferred — barely used in real games.
+                    // SWP / SWPB: top = 0001_0000 (word) / 0001_0100 (byte).
+                    if (top == 0b0001_0000) return comptime arm_handlers.swpHandler(false);
+                    if (top == 0b0001_0100) return comptime arm_handlers.swpHandler(true);
                     return unhandledArm;
                 }
                 // Halfword/signed transfer: low ∈ {1011, 1101, 1111}.
