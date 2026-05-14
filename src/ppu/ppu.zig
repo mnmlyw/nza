@@ -70,6 +70,12 @@ pub const Ppu = struct {
     affine_x: [2]i32 = [_]i32{ 0, 0 },
     affine_y: [2]i32 = [_]i32{ 0, 0 },
 
+    /// Vertical-mosaic cache: snapshot of bg_line / obj_line from the last
+    /// scanline that's a multiple of (mosaic_v+1). Reused on intermediate
+    /// scanlines that the mosaic replicates from.
+    bg_line_v: [4][SCREEN_WIDTH]LayerPixel = [_][SCREEN_WIDTH]LayerPixel{[_]LayerPixel{.{}} ** SCREEN_WIDTH} ** 4,
+    obj_line_v: [SCREEN_WIDTH]LayerPixel = [_]LayerPixel{.{}} ** SCREEN_WIDTH,
+
     pub fn init(self: *Ppu) void {
         self.io.vcount = 0;
         self.io.dispstat &= 0xFF07;
@@ -79,6 +85,9 @@ pub const Ppu = struct {
     pub fn onHdrawEnd(ctx: *anyopaque, late: u64) void {
         _ = late;
         const self: *Ppu = @ptrCast(@alignCast(ctx));
+
+        // PPU has finished pulling tile/sprite data for this scanline.
+        self.bus.ppu_in_hdraw = false;
 
         // Render the line we just finished drawing.
         if (self.io.vcount < @as(u16, @intCast(SCREEN_HEIGHT))) {
@@ -108,6 +117,8 @@ pub const Ppu = struct {
         const self: *Ppu = @ptrCast(@alignCast(ctx));
 
         self.io.dispstat &= ~@as(u16, 0x0002);
+        // Entering H-draw of the next visible scanline — re-arm contention.
+        self.bus.ppu_in_hdraw = self.io.vcount + 1 < VBLANK_FIRST_LINE;
         self.io.vcount += 1;
         if (self.io.vcount >= TOTAL_LINES) self.io.vcount = 0;
 
@@ -222,20 +233,20 @@ fn renderScanline(self: *Ppu, y: u16) void {
 
     if ((dispcnt & 0x1000) != 0) renderSprites(self, y, dispcnt);
 
-    applyMosaic(self);
+    applyMosaic(self, y);
 
     compositeScanline(self, y, dispcnt);
 }
 
 /// Apply MOSAIC horizontal stair-stepping to any BG that has BGCNT.6 set
-/// and to OBJ pixels flagged with mosaic (attr0 bit 12 — TODO: we don't
-/// track that per-OBJ yet; we apply OBJ mosaic universally if the OBJ-H
-/// nibble is non-zero, which matches most games). Vertical mosaic is
-/// deferred (would require per-row caching).
-fn applyMosaic(self: *Ppu) void {
+/// and to OBJ pixels flagged with mosaic. Vertical mosaic is applied via
+/// the `bg_line_v` / `obj_line_v` caches (see applyMosaicVertical).
+fn applyMosaic(self: *Ppu, y: u16) void {
     const mosaic = self.io.read(u16, 0x04C);
     const bg_h: u8 = @intCast(mosaic & 0xF);
+    const bg_v: u8 = @intCast((mosaic >> 4) & 0xF);
     const obj_h: u8 = @intCast((mosaic >> 8) & 0xF);
+    const obj_v: u8 = @intCast((mosaic >> 12) & 0xF);
 
     if (bg_h != 0) {
         const step: usize = @as(usize, bg_h) + 1;
@@ -264,6 +275,29 @@ fn applyMosaic(self: *Ppu) void {
             while (k < step and x + k < SCREEN_WIDTH) : (k += 1) {
                 self.obj_line[x + k] = group_color;
             }
+        }
+    }
+
+    // Vertical mosaic via cached scanlines.
+    if (bg_v != 0) {
+        const step_v = @as(u16, bg_v) + 1;
+        var bi: usize = 0;
+        while (bi < 4) : (bi += 1) {
+            const bgcnt = self.io.read(u16, 0x008 + @as(u32, @intCast(bi)) * 2);
+            if ((bgcnt & 0x40) == 0) continue;
+            if ((y % step_v) == 0) {
+                @memcpy(&self.bg_line_v[bi], &self.bg_line[bi]);
+            } else {
+                @memcpy(&self.bg_line[bi], &self.bg_line_v[bi]);
+            }
+        }
+    }
+    if (obj_v != 0) {
+        const step_v = @as(u16, obj_v) + 1;
+        if ((y % step_v) == 0) {
+            @memcpy(&self.obj_line_v, &self.obj_line);
+        } else {
+            @memcpy(&self.obj_line, &self.obj_line_v);
         }
     }
 }
@@ -670,8 +704,15 @@ fn renderTextBg(self: *Ppu, y: u16, bg: u2) void {
 fn renderSprites(self: *Ppu, y: u16, dispcnt: u16) void {
     const obj_one_d = (dispcnt & 0x40) != 0;
 
+    // OAM cycle budget per scanline: 1210 cycles, or 954 when DISPCNT.5
+    // ("OAM access during H-blank only" flag) is clear. Per-sprite cost:
+    // 2*W for non-affine, 10 + 2*W for affine.
+    const oam_hblank_free = (dispcnt & 0x20) == 0;
+    var oam_budget: i32 = if (oam_hblank_free) 1210 else 954;
+
     var entry: u32 = 0;
     while (entry < 128) : (entry += 1) {
+        if (oam_budget <= 0) break;
         const oam_addr = entry * 8;
         const attr0 = @as(u16, self.bus.oam[oam_addr]) | (@as(u16, self.bus.oam[oam_addr + 1]) << 8);
         const attr1 = @as(u16, self.bus.oam[oam_addr + 2]) | (@as(u16, self.bus.oam[oam_addr + 3]) << 8);
@@ -728,6 +769,14 @@ fn renderSprites(self: *Ppu, y: u16, dispcnt: u16) void {
         // For non-affine, compute py_in directly. For affine, use the
         // PC/PD matrix per pixel below.
         const py_in_sprite_raw: u32 = @intCast(dy_raw);
+
+        // Bill OAM cycle budget for this sprite before drawing it.
+        const sprite_cost: i32 = if (affine)
+            10 + @as(i32, @intCast(bbox_w * 2))
+        else
+            @as(i32, @intCast(bbox_w));
+        oam_budget -= sprite_cost;
+        if (oam_budget < 0) break;
 
         var px: u32 = 0;
         while (px < bbox_w) : (px += 1) {

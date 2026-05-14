@@ -404,8 +404,21 @@ pub fn mulHandler(comptime opcode: u4) decode.ArmFn {
                 cpu.cpsr.zero = result == 0;
                 // C is UNPREDICTABLE on ARM7TDMI MUL; leave unchanged.
             }
+            // I-cycle accounting: 1 + N based on Rs top-byte zero/one-detect.
+            // MUL = N internal cycles; MLA = N+1.
+            cpu.bus.wait_cycles_accum +%= mulInternalCycles(cpu.r[rs]);
+            if (accumulate) cpu.bus.wait_cycles_accum +%= 1;
         }
     }.handler;
+}
+
+/// ARM7TDMI variable-N timing for MUL/MLA: depends on which of the high
+/// bytes of Rs are all-zero or all-one (early-termination booth multiplier).
+fn mulInternalCycles(rs: u32) u8 {
+    if ((rs & 0xFFFF_FF00) == 0 or (rs & 0xFFFF_FF00) == 0xFFFF_FF00) return 1;
+    if ((rs & 0xFFFF_0000) == 0 or (rs & 0xFFFF_0000) == 0xFFFF_0000) return 2;
+    if ((rs & 0xFF00_0000) == 0 or (rs & 0xFF00_0000) == 0xFF00_0000) return 3;
+    return 4;
 }
 
 // =====================================================================
@@ -501,6 +514,9 @@ pub fn mulLongHandler(comptime uas: u3) decode.ArmFn {
                 cpu.cpsr.negative = (result & 0x8000_0000_0000_0000) != 0;
                 cpu.cpsr.zero = result == 0;
             }
+            // MULL takes mul-cycles +1, MLAL takes +2 over mulInternalCycles(Rs).
+            cpu.bus.wait_cycles_accum +%= mulInternalCycles(cpu.r[rs]) + 1;
+            if (accumulate) cpu.bus.wait_cycles_accum +%= 1;
         }
     }.handler;
 }

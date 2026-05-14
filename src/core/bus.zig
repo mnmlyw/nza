@@ -60,6 +60,11 @@ pub const Bus = struct {
     gpio: ?*gpio_mod.Gpio = null,
     save_dirty: bool = false,
 
+    /// Set by PPU at H-draw entry, cleared at H-blank. CPU accesses to
+    /// PRAM/VRAM/OAM during H-draw stall an additional cycle because PPU
+    /// is contending for the same bus.
+    ppu_in_hdraw: bool = false,
+
     io: io_mod.Io = .{},
 
     /// Last code fetch, used as the open-bus value once the CPU pipeline is
@@ -263,6 +268,11 @@ pub const Bus = struct {
         else
             self.wait16[region][idx];
         self.wait_cycles_accum +%= cost;
+        // PPU bus contention: CPU touching PRAM/VRAM/OAM during H-draw
+        // stalls 1 cycle (2 for 32-bit access to PRAM/VRAM).
+        if (self.ppu_in_hdraw and (region == 0x5 or region == 0x6 or region == 0x7)) {
+            self.wait_cycles_accum +%= if (@typeInfo(T).int.bits == 32 and region != 0x7) 2 else 1;
+        }
     }
 
     /// Recompute the cart-ROM and SRAM wait tables from WAITCNT (read from
