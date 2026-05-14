@@ -222,7 +222,9 @@ pub fn dataProcHandler(comptime top: u8, comptime low: u4) decode.ArmFn {
                     cpu.pipe_access = .seq;
                     shift = (instr >> 7) & 0x1F;
                 } else {
-                    shift = cpu.r[@as(u4, @intCast((instr >> 8) & 0xF))];
+                    // NBA's DoShift takes u8 — implicitly masks the register
+                    // value's low byte. Match that here.
+                    shift = cpu.r[@as(u4, @intCast((instr >> 8) & 0xF))] & 0xFF;
                     // NBA: state.r15 += 4; bus.Idle(); pipe.access = NSeq;
                     cpu.r[15] +%= 4;
                     cpu.bus.wait_cycles_accum +%= 1; // I-cycle
@@ -273,7 +275,10 @@ pub fn dataProcHandler(comptime top: u8, comptime low: u4) decode.ArmFn {
                 0xF => result = ~op2, // MVN
             }
 
-            if (set_flags and rd != 15) {
+            // Flag computation: for TST/TEQ/CMP/CMN this is the primary
+            // effect (write_back=false). For others, only if S-bit set
+            // AND rd != 15 (the rd=15 case goes through CPSR-restore).
+            if (!write_back or (set_flags and rd != 15)) {
                 switch (opcode) {
                     0x0, 0x1, 0x8, 0x9, 0xC, 0xD, 0xE, 0xF => setLogicalFlags(cpu, result, carry),
                     0x2, 0xA => setArithFlags(cpu, op1, op2, result, true),
@@ -291,6 +296,10 @@ pub fn dataProcHandler(comptime top: u8, comptime low: u4) decode.ArmFn {
                     if (set_flags) restoreCpsrFromSpsr(cpu);
                     cpu.reloadPipeline();
                 }
+            } else if (rd == 15 and set_flags) {
+                // CMP/TST/TEQ/CMN with Rd=15 and S=1 is the legacy
+                // P-variant: restore CPSR from SPSR (no pipeline reload).
+                restoreCpsrFromSpsr(cpu);
             }
         }
     }.handler;

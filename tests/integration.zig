@@ -68,6 +68,14 @@ fn runRom(name: []const u8, frames: u32) !?RomResult {
     const dump_path = try std.fmt.bufPrintZ(&path_dump_buf, "/tmp/nza-{s}.ppm", .{name});
     dumpFramebufferPpm(dump_path, &core.ppu.framebuffer) catch {};
 
+    // jsmolka's m_exit writes the failing test number to r12 (ARM) or
+    // r7 (Thumb). Print both so we can see what failed regardless of
+    // which test runner mode left the CPU.
+    std.debug.print("[run] {s} r0..r12={any} r12={d}/r7={d}\n", .{
+        name, core.cpu.r[0..13],
+        core.cpu.r[12], core.cpu.r[7],
+    });
+
     return RomResult{
         .framebuffer_hash = fnv1a(fb_bytes),
         .last_pc = core.cpu.r[15],
