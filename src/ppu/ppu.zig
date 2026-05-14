@@ -31,6 +31,22 @@ pub const TOTAL_LINES: u16 = 228;
 const TAG_HDRAW_END: u32 = 0x1000;
 const TAG_HBLANK_END: u32 = 0x1001;
 
+/// Per-pixel layer state. Each BG renderer writes one of these to its
+/// layer buffer; the compositor reads them at end of scanline.
+pub const LayerPixel = packed struct(u32) {
+    /// Raw BGR555 color from PRAM (or the actual u16 for direct-color modes).
+    color: u16 = 0,
+    /// BG priority 0..3 (0=topmost). For sprites, this is the OBJ priority.
+    priority: u8 = 4,
+    /// bit 0 = pixel is opaque
+    /// bit 1 = obj-window source pixel
+    /// bit 2 = sprite is "semi-transparent" (overrides BLDCNT 1st-target)
+    flags: u8 = 0,
+};
+pub const FLAG_OPAQUE: u8 = 0b001;
+pub const FLAG_OBJ_WINDOW: u8 = 0b010;
+pub const FLAG_OBJ_BLEND: u8 = 0b100;
+
 pub const Ppu = struct {
     sched: *Scheduler,
     io: *Io,
@@ -40,6 +56,13 @@ pub const Ppu = struct {
 
     /// 32-bit ARGB8888 framebuffer (matches SDL_PIXELFORMAT_ARGB8888).
     framebuffer: [FB_LEN]u32 = [_]u32{0} ** FB_LEN,
+
+    /// Per-layer line buffers (per-scanline scratch). bg_line[0..3] are
+    /// BG0..BG3; obj_line is the merged OBJ result; obj_win is set by
+    /// "OBJ window" sprites.
+    bg_line: [4][SCREEN_WIDTH]LayerPixel = [_][SCREEN_WIDTH]LayerPixel{[_]LayerPixel{.{}} ** SCREEN_WIDTH} ** 4,
+    obj_line: [SCREEN_WIDTH]LayerPixel = [_]LayerPixel{.{}} ** SCREEN_WIDTH,
+    obj_win: [SCREEN_WIDTH]bool = [_]bool{false} ** SCREEN_WIDTH,
 
     pub fn init(self: *Ppu) void {
         self.io.vcount = 0;

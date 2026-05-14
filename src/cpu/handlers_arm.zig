@@ -435,22 +435,25 @@ pub fn blockTransferHandler(comptime top: u8) decode.ArmFn {
             var cur: u32 = start_addr;
             if (P == U) cur +%= 4; // (P=1, U=1) or (P=0, U=0) shifts by +4
 
+            // First transfer is N-cycle, subsequent are S-cycle. Track
+            // whether we've done the first one yet.
+            var first = true;
             var i: u5 = 0;
             while (i < 16) : (i += 1) {
                 if ((list >> @intCast(i)) & 1 == 0) continue;
                 const reg: u4 = @intCast(i);
+                const access: @TypeOf(cpu.bus.*).Access = if (first) .nonseq else .seq;
+                first = false;
                 if (L) {
-                    cpu.r[reg] = cpu.bus.read(u32, cur);
+                    cpu.r[reg] = cpu.bus.readTimed(u32, cur, access);
                     if (reg == 15) {
-                        // LDM with PC in list + S bit = "return from
-                        // exception": restore CPSR from SPSR_<mode>.
                         if (S) restoreCpsrFromSpsr(cpu);
                         cpu.reloadPipeline();
                     }
                 } else {
                     var v = cpu.r[reg];
                     if (reg == 15) v +%= 4;
-                    cpu.bus.write(u32, cur, v);
+                    cpu.bus.writeTimed(u32, cur, access, v);
                 }
                 cur +%= 4;
             }

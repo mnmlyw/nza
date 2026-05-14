@@ -57,9 +57,32 @@ pub const Bus = struct {
     /// in. Today it's just zero.
     last_code_fetch: u32 = 0,
 
+    /// Cycles spent on bus accesses since the CPU last cleared this.
+    wait_cycles_accum: u32 = 0,
+
+    /// Per-region 16-bit access cycle counts: [region][N=0, S=1].
+    /// Index 0 = nonseq, index 1 = seq (and code, which is a sequential
+    /// instruction fetch). Recomputed when WAITCNT (0x4000204) is written.
+    wait16: [16][2]u8 = default_wait16,
+    /// Same for 32-bit access.
+    wait32: [16][2]u8 = default_wait32,
+
+    /// Bus access type. Real ARM7TDMI signals N (nonseq) / S (seq) / I
+    /// (internal) on every bus transaction; cart waitstates differ for each.
+    pub const Access = enum(u2) { nonseq, seq, code };
+
     pub fn read(self: *Bus, comptime T: type, addr: u32) T {
+        return self.readTimed(T, addr, .nonseq);
+    }
+
+    pub fn write(self: *Bus, comptime T: type, addr: u32, value: T) void {
+        self.writeTimed(T, addr, .nonseq, value);
+    }
+
+    pub fn readTimed(self: *Bus, comptime T: type, addr: u32, access: Access) T {
         comptime checkType(T);
         const region = (addr >> 24) & 0xF;
+        self.billCycles(T, region, access);
         return switch (region) {
             0x0 => if ((addr & 0xFFFF_FFFF) < 0x4000)
                 readSlice(T, self.bios[0..], addr & 0x3FFF)
@@ -78,14 +101,22 @@ pub const Bus = struct {
         };
     }
 
-    pub fn write(self: *Bus, comptime T: type, addr: u32, value: T) void {
+    pub fn writeTimed(self: *Bus, comptime T: type, addr: u32, access: Access, value: T) void {
         comptime checkType(T);
         const region = (addr >> 24) & 0xF;
+        self.billCycles(T, region, access);
         switch (region) {
             0x0 => {}, // BIOS is read-only
             0x2 => writeSlice(T, self.wram[0..], addr & (WRAM_SIZE - 1), value),
             0x3 => writeSlice(T, self.iram[0..], addr & (IRAM_SIZE - 1), value),
-            0x4 => self.io.write(T, addr & 0x3FF, value),
+            0x4 => {
+                self.io.write(T, addr & 0x3FF, value);
+                // WAITCNT (0x04000204) touches our wait tables.
+                const io_off = addr & 0x3FF;
+                if (io_off <= 0x205 and io_off + (@typeInfo(T).int.bits / 8) > 0x204) {
+                    self.applyWaitCnt();
+                }
+            },
             0x5 => writeSlice(T, self.pram[0..], addr & (PRAM_SIZE - 1), value),
             0x6 => writeSlice(T, self.vram[0..], vramAddr(addr), value),
             0x7 => writeSlice(T, self.oam[0..], addr & (OAM_SIZE - 1), value),
@@ -153,6 +184,110 @@ pub const Bus = struct {
             self.sram[sram_addr] = b;
         }
     }
+
+    inline fn billCycles(self: *Bus, comptime T: type, region: u32, access: Access) void {
+        const idx: usize = if (access == .nonseq) 0 else 1;
+        const cost: u8 = if (@typeInfo(T).int.bits == 32)
+            self.wait32[region][idx]
+        else
+            self.wait16[region][idx];
+        self.wait_cycles_accum +%= cost;
+    }
+
+    /// Recompute the cart-ROM and SRAM wait tables from WAITCNT (read from
+    /// `io.raw[0x204..0x205]`). Called by `io.zig` on writes to that
+    /// register.
+    pub fn applyWaitCnt(self: *Bus) void {
+        const lo = self.io.raw[0x204];
+        const hi = self.io.raw[0x205];
+        const w: u16 = @as(u16, lo) | (@as(u16, hi) << 8);
+
+        // SRAM cycles (bits 0-1): table {4,3,2,8}
+        const sram_n: u8 = sram_table[w & 0x3];
+        // WS0 N (bits 2-3): same table; S (bit 4): 0=2, 1=1
+        const ws0_n: u8 = sram_table[(w >> 2) & 0x3];
+        const ws0_s: u8 = if ((w & 0x10) != 0) 1 else 2;
+        // WS1 N (bits 5-6); S (bit 7): 0=4, 1=1
+        const ws1_n: u8 = sram_table[(w >> 5) & 0x3];
+        const ws1_s: u8 = if ((w & 0x80) != 0) 1 else 4;
+        // WS2 N (bits 8-9); S (bit 10): 0=8, 1=1
+        const ws2_n: u8 = sram_table[(w >> 8) & 0x3];
+        const ws2_s: u8 = if ((w & 0x400) != 0) 1 else 8;
+
+        // Bus access also takes 1 internal cycle on top of waitstates.
+        self.wait16[0x8][0] = 1 + ws0_n;
+        self.wait16[0x8][1] = 1 + ws0_s;
+        self.wait16[0x9] = self.wait16[0x8];
+        self.wait16[0xA][0] = 1 + ws1_n;
+        self.wait16[0xA][1] = 1 + ws1_s;
+        self.wait16[0xB] = self.wait16[0xA];
+        self.wait16[0xC][0] = 1 + ws2_n;
+        self.wait16[0xC][1] = 1 + ws2_s;
+        self.wait16[0xD] = self.wait16[0xC];
+
+        // 32-bit cart access = N + S (two 16-bit fetches).
+        self.wait32[0x8][0] = 1 + ws0_n + ws0_s;
+        self.wait32[0x8][1] = 1 + 2 * ws0_s;
+        self.wait32[0x9] = self.wait32[0x8];
+        self.wait32[0xA][0] = 1 + ws1_n + ws1_s;
+        self.wait32[0xA][1] = 1 + 2 * ws1_s;
+        self.wait32[0xB] = self.wait32[0xA];
+        self.wait32[0xC][0] = 1 + ws2_n + ws2_s;
+        self.wait32[0xC][1] = 1 + 2 * ws2_s;
+        self.wait32[0xD] = self.wait32[0xC];
+
+        // SRAM region (8-bit only on real hardware; we still bill the
+        // 16/32-bit access as if it were one byte access — close enough).
+        self.wait16[0xE][0] = 1 + sram_n;
+        self.wait16[0xE][1] = 1 + sram_n;
+        self.wait16[0xF] = self.wait16[0xE];
+        self.wait32[0xE] = self.wait16[0xE];
+        self.wait32[0xF] = self.wait16[0xE];
+    }
+};
+
+const sram_table = [4]u8{ 4, 3, 2, 8 };
+
+/// Default wait tables — non-cart regions have fixed cycle costs per
+/// GBATEK. Cart regions (0x8-0xD) start at WAITCNT=0 defaults (= ws table
+/// index 0 → 4-cycle N, max-latency S). `applyWaitCnt()` updates them.
+const default_wait16: [16][2]u8 = blk: {
+    var t: [16][2]u8 = [_][2]u8{[2]u8{ 1, 1 }} ** 16;
+    // EWRAM: 3 cycles for any access.
+    t[0x2] = [2]u8{ 3, 3 };
+    // Cart ROM (WAITCNT=0 default): N=4, S=2, +1 internal.
+    const cart16 = [2]u8{ 5, 3 };
+    t[0x8] = cart16;
+    t[0x9] = cart16;
+    t[0xA] = cart16;
+    t[0xB] = cart16;
+    t[0xC] = cart16;
+    t[0xD] = cart16;
+    // SRAM: N=4, +1 internal.
+    t[0xE] = [2]u8{ 5, 5 };
+    t[0xF] = [2]u8{ 5, 5 };
+    break :blk t;
+};
+
+const default_wait32: [16][2]u8 = blk: {
+    var t: [16][2]u8 = [_][2]u8{[2]u8{ 1, 1 }} ** 16;
+    // EWRAM 32-bit: 6 cycles (two 16-bit halves).
+    t[0x2] = [2]u8{ 6, 6 };
+    // PRAM 32-bit: 2 cycles.
+    t[0x5] = [2]u8{ 2, 2 };
+    // VRAM 32-bit: 2 cycles.
+    t[0x6] = [2]u8{ 2, 2 };
+    // Cart ROM 32-bit at WAITCNT=0: N=4+2+1, S=2+2+1.
+    const cart32 = [2]u8{ 7, 5 };
+    t[0x8] = cart32;
+    t[0x9] = cart32;
+    t[0xA] = cart32;
+    t[0xB] = cart32;
+    t[0xC] = cart32;
+    t[0xD] = cart32;
+    t[0xE] = [2]u8{ 5, 5 };
+    t[0xF] = [2]u8{ 5, 5 };
+    break :blk t;
 };
 
 /// VRAM mirror behavior: address space repeats every 128 KB, but each 128 KB

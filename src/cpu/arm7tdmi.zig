@@ -119,17 +119,19 @@ pub const Cpu = struct {
     /// PC change (branch, mode switch, exception entry). Also marks
     /// `self.branched = true` so `step()` skips its sequential PC advance.
     pub fn reloadPipeline(self: *Cpu) void {
+        // After a branch / mode-switch / exception entry, the pipeline
+        // refill costs one N-cycle fetch + one S-cycle fetch.
         if (self.cpsr.thumb) {
             self.r[15] &= ~@as(u32, 1);
-            self.pipeline[0] = self.bus.read(u16, self.r[15]);
+            self.pipeline[0] = self.bus.readTimed(u16, self.r[15], .nonseq);
             self.r[15] +%= 2;
-            self.pipeline[1] = self.bus.read(u16, self.r[15]);
+            self.pipeline[1] = self.bus.readTimed(u16, self.r[15], .seq);
             self.r[15] +%= 2;
         } else {
             self.r[15] &= ~@as(u32, 3);
-            self.pipeline[0] = self.bus.read(u32, self.r[15]);
+            self.pipeline[0] = self.bus.readTimed(u32, self.r[15], .nonseq);
             self.r[15] +%= 4;
-            self.pipeline[1] = self.bus.read(u32, self.r[15]);
+            self.pipeline[1] = self.bus.readTimed(u32, self.r[15], .seq);
             self.r[15] +%= 4;
         }
         self.branched = true;
@@ -144,12 +146,13 @@ pub const Cpu = struct {
     /// in Thumb mode, matching the ARM ARM PC value. Reads of PC by ordinary
     /// instructions (ADD Rd, PC, #imm etc.) "just work" without compensation.
     pub fn step(self: *Cpu) void {
-        self.cycles = 1;
         self.branched = false;
+        self.bus.wait_cycles_accum = 0;
         if (self.cpsr.thumb) {
             const instr: u16 = @truncate(self.pipeline[0]);
             self.pipeline[0] = self.pipeline[1];
-            self.pipeline[1] = self.bus.read(u16, self.r[15]);
+            // Sequential code-fetch in Thumb (16-bit).
+            self.pipeline[1] = self.bus.readTimed(u16, self.r[15], .seq);
             self.bus.last_code_fetch = @as(u32, self.pipeline[1]) | (@as(u32, self.pipeline[1]) << 16);
             const idx: u10 = @intCast((instr >> 6) & 0x3FF);
             decode.thumb_lut[idx](self, instr);
@@ -157,11 +160,12 @@ pub const Cpu = struct {
         } else {
             const instr = self.pipeline[0];
             self.pipeline[0] = self.pipeline[1];
-            self.pipeline[1] = self.bus.read(u32, self.r[15]);
+            self.pipeline[1] = self.bus.readTimed(u32, self.r[15], .seq);
             self.bus.last_code_fetch = self.pipeline[1];
 
             const cond: u4 = @intCast(instr >> 28);
             if (!checkCondition(self.cpsr, cond)) {
+                self.cycles = self.bus.wait_cycles_accum;
                 self.r[15] +%= 4;
                 return;
             }
@@ -170,6 +174,13 @@ pub const Cpu = struct {
             decode.arm_lut[hash](self, instr);
             if (!self.branched) self.r[15] +%= 4;
         }
+        // Cycles for this instruction = all bus access cycles charged.
+        // (Branches add 2N+1S worth of pipeline refill via `reloadPipeline`
+        // calling `readTimed(.nonseq)` + `.seq` automatically.)
+        self.cycles = self.bus.wait_cycles_accum;
+        // Always bill at least 1 internal cycle for the execute itself —
+        // ARM7TDMI never takes 0 cycles even for a NOP.
+        if (self.cycles == 0) self.cycles = 1;
     }
 
     /// Change processor mode, saving/restoring the appropriate banked regs.
