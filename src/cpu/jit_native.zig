@@ -198,12 +198,17 @@ pub fn translateArm(em: *Emitter, instr: u32) bool {
     return false;
 }
 
-/// C-ABI trampoline so the JIT-emitted call site can use AAPCS64
-/// register passing (X0=cpu, X1=instr) regardless of how Zig chooses
-/// to pass args to its `.auto`-convention handlers.
+/// C-ABI trampolines bridging Zig's `.auto` calling convention to
+/// AAPCS64. JIT-emitted BLR sites pass (X0=cpu, X1=instr) and these
+/// trampolines forward through the interpreter LUT.
 pub fn callArmHandler(cpu: *Cpu, instr: u32) callconv(.c) void {
     const hash: u12 = @intCast(((instr >> 16) & 0xFF0) | ((instr >> 4) & 0x00F));
     decode.arm_lut[hash](cpu, instr);
+}
+
+pub fn callThumbHandler(cpu: *Cpu, instr: u32) callconv(.c) void {
+    const idx: u10 = @intCast((instr >> 6) & 0x3FF);
+    decode.thumb_lut[idx](cpu, @intCast(instr & 0xFFFF));
 }
 
 /// Compile a sequence of ARM instructions into a function-pointer that
@@ -244,6 +249,40 @@ pub fn compileBlock(page: *CodePage, instrs: []const u32) ?NativeFn {
     }
 
     // Epilogue.
+    em.ldrXImmU(19, 0);
+    em.ldrXImmU(30, 8);
+    em.addSpImm(16);
+    em.ret();
+
+    page.used += em.pos;
+    sys_icache_invalidate(start, em.pos);
+    return @ptrCast(@alignCast(start));
+}
+
+/// Compile a sequence of Thumb instructions. All Thumb instructions
+/// route through callThumbHandler — Thumb's per-format complexity
+/// makes native translation a larger effort, but the JIT supports
+/// the full ISA via interpreter fallback.
+pub fn compileThumbBlock(page: *CodePage, instrs: []const u16) ?NativeFn {
+    if (page.used + 64 + instrs.len * 32 > page.len) return null;
+    if (builtin.os.tag == .macos) pthread_jit_write_protect_np(0);
+    defer if (builtin.os.tag == .macos) pthread_jit_write_protect_np(1);
+
+    var em = Emitter{ .buf = page.mem + page.used, .cap = page.len - page.used };
+    const start = page.mem + page.used;
+
+    em.subSpImm(16);
+    em.strXImmU(19, 0);
+    em.strXImmU(30, 8);
+    em.movXX(19, 0);
+
+    for (instrs) |instr| {
+        em.movXX(0, 19);
+        em.movzX(1, instr, 0);
+        em.loadX(16, @intFromPtr(&callThumbHandler));
+        em.blr(16);
+    }
+
     em.ldrXImmU(19, 0);
     em.ldrXImmU(30, 8);
     em.addSpImm(16);
@@ -321,6 +360,24 @@ test "JIT block: native MOV + interpreter-fallback ADD" {
     fn_ptr(&cpu);
     try std.testing.expectEqual(@as(u32, 42), cpu.r[5]);
     try std.testing.expectEqual(@as(u32, 50), cpu.r[6]);
+}
+
+test "JIT compiles Thumb block via interpreter callouts" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return;
+    var page = CodePage.alloc() orelse return;
+    defer page.free();
+
+    // Thumb: MOV r2, #100 (Format 3) — encoding 0x2264.
+    // Thumb: MOV r3, #200 (Format 3) — encoding 0x23C8.
+    const block = [_]u16{ 0x2264, 0x23C8 };
+    const fn_ptr = compileThumbBlock(&page, &block) orelse return error.JitNotSupported;
+
+    var bus: @import("../core/bus.zig").Bus = .{};
+    var cpu = Cpu.init(&bus);
+    cpu.cpsr.thumb = true;
+    fn_ptr(&cpu);
+    try std.testing.expectEqual(@as(u32, 100), cpu.r[2]);
+    try std.testing.expectEqual(@as(u32, 200), cpu.r[3]);
 }
 
 test "JIT compiles ARM MVN r3, #0 and executes" {
