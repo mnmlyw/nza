@@ -80,10 +80,12 @@ translations so far.
   in arm.gba that we haven't isolated. memory.gba and thumb.gba both
   pass now (M3.5 closure fixes: Thumb POP-pc mode preservation +
   OAM/PRAM/VRAM byte-write rules).
-- **M4A song-transition stall** (Pokémon Emerald). M4A engine stops
-  updating its IRAM mixer buffer after ~5s; same audio loops. Likely a
-  timing-sensitive flag the CPU isn't setting right — needs pret/
-  pokeemerald cross-reference.
+<!-- M4A song-transition stall fixed by M5 NBA port; see CHANGELOG. -->
+
+(M4A song-transition stall in Pokémon Emerald is now fixed — the
+NBA-port pass identified the underlying bugs: shift-by-register PC
++12 semantic, multiply I-cycle accounting, Thumb shift I-cycles, and
+IRQ-disable latching at instruction boundaries.)
 - **Some Pokémon audio specifics.** M4A song-transition stall still open
   (task #12). PSG channel 3 wave pattern bank-switch edge case.
 - **JIT speedup.** The JIT compiles and runs every ARM+Thumb
