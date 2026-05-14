@@ -31,13 +31,14 @@ house with correct rendering and audio.
 | M4.6 | JIT block-cache scaffold (basic-block discovery, code cache) | done |
 | M4.7 | JIT native AArch64 emitter — full ARM + Thumb coverage via interpreter fallback | done |
 
-~8700 LOC. 60/60 unit tests + 4/4 integration tests passing.
+~8800 LOC. 64/64 unit tests + 4/4 integration tests passing.
 
-**JIT coverage**: every ARM and Thumb instruction can flow through
-the JIT. Hot opcodes get native AArch64 translation (today: MOV imm
-and MVN imm); everything else emits a BLR to a C-ABI trampoline
-that dispatches through the interpreter handler. The same pattern
-NBA uses, just with fewer specialized translations so far.
+**JIT coverage**: every ARM and Thumb instruction flows through the
+JIT. Hot opcodes get native AArch64 translation (currently: MOV /
+MVN / ADD / SUB / ORR / AND immediate); everything else emits a BLR
+to a C-ABI trampoline that dispatches through the interpreter
+handler. Same pattern NBA uses, just with fewer specialized
+translations so far.
 
 ## What works
 
