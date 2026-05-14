@@ -8,6 +8,7 @@
 const std = @import("std");
 const Keypad = @import("../keypad/keypad.zig").Keypad;
 const Button = @import("../keypad/keypad.zig").Button;
+const config = @import("config.zig");
 
 pub const WIDTH: c_int = 240;
 pub const HEIGHT: c_int = 160;
@@ -36,11 +37,42 @@ const SDL_KeyboardEvent = extern struct {
     keysym: SDL_Keysym,
 };
 
+const SDL_ControllerButtonEvent = extern struct {
+    type: u32,
+    timestamp: u32,
+    which: i32,
+    button: u8,
+    state: u8,
+    _pad2: u8,
+    _pad3: u8,
+};
+
+const SDL_ControllerDeviceEvent = extern struct {
+    type: u32,
+    timestamp: u32,
+    which: i32,
+};
+
 const SDL_Event = extern union {
     type: u32,
     key: SDL_KeyboardEvent,
+    cbutton: SDL_ControllerButtonEvent,
+    cdevice: SDL_ControllerDeviceEvent,
     _pad: [56]u8,
 };
+
+const SDL_GameController = opaque {};
+const SDL_INIT_GAMECONTROLLER: u32 = 0x2000;
+const SDL_CONTROLLERDEVICEADDED: u32 = 0x650;
+const SDL_CONTROLLERDEVICEREMOVED: u32 = 0x651;
+const SDL_CONTROLLERBUTTONDOWN: u32 = 0x650 + 3;
+const SDL_CONTROLLERBUTTONUP: u32 = 0x650 + 4;
+
+extern fn SDL_NumJoysticks() c_int;
+extern fn SDL_IsGameController(joystick_index: c_int) c_int;
+extern fn SDL_GameControllerOpen(joystick_index: c_int) ?*SDL_GameController;
+extern fn SDL_GameControllerClose(gamecontroller: *SDL_GameController) void;
+extern fn SDL_GameControllerEventState(state: c_int) c_int;
 
 extern fn SDL_Init(flags: u32) c_int;
 extern fn SDL_Quit() void;
@@ -141,10 +173,13 @@ pub const Frontend = struct {
     audio_dev: u32 = 0,
     audio_buf: [4096]i16 = [_]i16{0} ** 4096,
     fullscreen: bool = false,
+    controller: ?*SDL_GameController = null,
+    cfg: config.Config = .{},
 
     pub fn init() Error!Frontend {
-        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) return error.SdlInit;
+        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) return error.SdlInit;
         errdefer SDL_Quit();
+        _ = SDL_GameControllerEventState(1); // enable
 
         const window = SDL_CreateWindow(
             "nza",
@@ -197,11 +232,27 @@ pub const Frontend = struct {
     }
 
     pub fn deinit(self: *Frontend) void {
+        if (self.controller) |c| SDL_GameControllerClose(c);
         if (self.audio_dev != 0) SDL_PauseAudioDevice(self.audio_dev, 1);
         SDL_DestroyTexture(self.texture);
         SDL_DestroyRenderer(self.renderer);
         SDL_DestroyWindow(self.window);
         SDL_Quit();
+    }
+
+    /// Open the first available game controller, if any.
+    pub fn openController(self: *Frontend) void {
+        const n = SDL_NumJoysticks();
+        var i: c_int = 0;
+        while (i < n) : (i += 1) {
+            if (SDL_IsGameController(i) == 1) {
+                self.controller = SDL_GameControllerOpen(i);
+                if (self.controller != null) {
+                    std.debug.print("[input] opened game controller index {d}\n", .{i});
+                    return;
+                }
+            }
+        }
     }
 
     /// Drain `apu.out` and queue the samples to SDL. Returns SDL's queued-byte
@@ -228,7 +279,6 @@ pub const Frontend = struct {
     /// etc.) for the main loop to dispatch. Returns false when the user
     /// requests quit.
     pub fn pollEvents(self: *Frontend, keypad: *Keypad, out_hotkeys: *std.ArrayList(HotKeyEvent), allocator: std.mem.Allocator) bool {
-        _ = self;
         var ev: SDL_Event = undefined;
         while (SDL_PollEvent(&ev) != 0) {
             switch (ev.type) {
@@ -240,7 +290,24 @@ pub const Frontend = struct {
                         out_hotkeys.append(allocator, hk) catch {};
                         continue;
                     }
+                    if (config.buttonForKey(self.cfg.key_map, ev.key.keysym.sym)) |b| {
+                        if (down) keypad.press(b) else keypad.release(b);
+                        continue;
+                    }
+                    // Fallback to scancode for the arrow keys + shift.
                     if (mapKey(ev.key.keysym.sym, ev.key.keysym.scancode)) |b| {
+                        if (down) keypad.press(b) else keypad.release(b);
+                    }
+                },
+                SDL_CONTROLLERDEVICEADDED => self.openController(),
+                SDL_CONTROLLERDEVICEREMOVED => {
+                    if (self.controller) |c| SDL_GameControllerClose(c);
+                    self.controller = null;
+                },
+                SDL_CONTROLLERBUTTONDOWN, SDL_CONTROLLERBUTTONUP => {
+                    const down = ev.type == SDL_CONTROLLERBUTTONDOWN;
+                    const idx: i8 = @intCast(ev.cbutton.button);
+                    if (config.buttonForControllerButton(self.cfg.controller_map, idx)) |b| {
                         if (down) keypad.press(b) else keypad.release(b);
                     }
                 },

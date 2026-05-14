@@ -190,6 +190,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var fe = try sdl.Frontend.init();
     defer fe.deinit();
 
+    // Load user config (key remap, gamepad map, low-pass, fullscreen).
+    const config = @import("frontend/config.zig");
+    const cfg_path = config.defaultConfigPath(allocator) catch null;
+    if (cfg_path) |p| {
+        defer allocator.free(p);
+        fe.cfg = config.load(allocator, p);
+    }
+    core.apu.lowpass_enabled = fe.cfg.lowpass;
+    fe.openController();
+    if (fe.cfg.fullscreen) fe.toggleFullscreen();
+
     // Rewind is enabled by default; it's cheap and lets Backspace rewind.
     core.setRewindEnabled(true);
 
@@ -358,6 +369,7 @@ test {
     _ = @import("core/flash.zig");
     _ = @import("core/eeprom.zig");
     _ = @import("core/snapshot.zig");
+    _ = @import("frontend/config.zig");
     _ = @import("apu/apu.zig");
     _ = @import("apu/psg.zig");
     _ = @import("cpu/arm7tdmi.zig");

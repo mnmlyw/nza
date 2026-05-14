@@ -101,6 +101,12 @@ pub const Apu = struct {
     out_head: usize = 0,
     out_tail: usize = 0,
 
+    /// One-pole IIR low-pass state per side. Optional; cuts ~8 kHz aliasing
+    /// from Direct Sound when enabled.
+    lp_l: i32 = 0,
+    lp_r: i32 = 0,
+    lowpass_enabled: bool = false,
+
     pub const OUT_RING: usize = 8192;
 
     pub fn init(self: *Apu) void {
@@ -365,6 +371,13 @@ pub const Apu = struct {
         if (a_to_r) right +%= a_i16;
         if (b_to_l) left +%= b_i16;
         if (b_to_r) right +%= b_i16;
+
+        if (self.lowpass_enabled) {
+            self.lp_l = @divTrunc(left + self.lp_l, 2);
+            self.lp_r = @divTrunc(right + self.lp_r, 2);
+            left = self.lp_l;
+            right = self.lp_r;
+        }
 
         const l_clamped: i16 = @intCast(std.math.clamp(left, -32768, 32767));
         const r_clamped: i16 = @intCast(std.math.clamp(right, -32768, 32767));
