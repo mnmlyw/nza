@@ -155,6 +155,13 @@ pub const Io = struct {
                 // if the start bit (bit 15) is set, simulate immediate
                 // transfer completion. Multi-mode reads of SIOMULTI0..3
                 // return 0xFFFF (no link partner). Raise SIO IRQ if enabled.
+                //
+                // This also covers GBA Wireless Adapter detection (used by
+                // Pokémon FireRed/LeafGreen and Mario Tennis): the game
+                // sends Normal-32 packets and reads SIODATA32 (= bytes at
+                // 0x120-0x123). Our default-fill of 0xFFFF means the game
+                // sees 0xFFFFFFFF, treats that as "no adapter present,"
+                // and falls back to single-player.
                 if (offset == REG_SIOCNT + 1) {
                     if ((value & 0x80) != 0) {
                         // Clear start bit; transfer "done".
