@@ -644,20 +644,43 @@ pub fn multipleLoadStoreHandler(comptime is_load: bool) decode.ThumbFn {
                 cpu.r[rb] +%= 0x40;
                 return;
             }
-            var i: u4 = 0;
-            while (i < 8) : (i += 1) {
-                if (((rlist >> @intCast(i)) & 1) == 0) continue;
-                if (is_load) {
+            if (is_load) {
+                var i: u4 = 0;
+                while (i < 8) : (i += 1) {
+                    if (((rlist >> @intCast(i)) & 1) == 0) continue;
                     cpu.r[i] = cpu.bus.read(u32, addr);
-                } else {
-                    cpu.bus.write(u32, addr, cpu.r[i]);
+                    addr +%= 4;
                 }
+                cpu.bus.wait_cycles_accum +%= 1; // NBA: bus.Idle()
+                // LDM with rb in list: skip writeback (loaded value wins).
+                const rb_in_list = ((rlist >> @intCast(rb)) & 1) != 0;
+                if (!rb_in_list) cpu.r[rb] = addr;
+            } else {
+                // STM: NBA writes the FIRST register, THEN writeback, THEN
+                // remaining registers. So if base is in list and NOT first,
+                // the stored value is the WRITTEN-BACK base.
+                var count: u4 = 0;
+                var first: u4 = 0;
+                var k: i4 = 7;
+                while (k >= 0) : (k -= 1) {
+                    if (((rlist >> @intCast(k)) & 1) != 0) {
+                        count += 1;
+                        first = @intCast(k);
+                    }
+                }
+                const base_new: u32 = addr +% (@as(u32, count) * 4);
+
+                cpu.bus.write(u32, addr, cpu.r[first]);
+                cpu.r[rb] = base_new;
                 addr +%= 4;
+
+                var i: u4 = first + 1;
+                while (i < 8) : (i += 1) {
+                    if (((rlist >> @intCast(i)) & 1) == 0) continue;
+                    cpu.bus.write(u32, addr, cpu.r[i]);
+                    addr +%= 4;
+                }
             }
-            // Writeback unless LDM with rb in list (loaded value wins).
-            const rb_in_list = ((rlist >> @intCast(rb)) & 1) != 0;
-            if (!(is_load and rb_in_list)) cpu.r[rb] = addr;
-            if (is_load) cpu.bus.wait_cycles_accum +%= 1; // NBA: bus.Idle()
         }
     }.handler;
 }

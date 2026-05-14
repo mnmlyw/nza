@@ -568,16 +568,26 @@ pub fn blockTransferHandler(comptime top: u8) decode.ArmFn {
                 mode_save != @intFromEnum(cpu_mod.Mode.sys);
             if (switch_mode) cpu.switchMode(.user);
 
+            const base_new = if (list == 0) addr +% (if (U) @as(u32, 0x40) else @as(u32, 0) -% 0x40) else end_addr;
+
             var first = true;
             var i: u5 = 0;
             while (i < 16) : (i += 1) {
                 if ((effective_list >> @intCast(i)) & 1 == 0) continue;
                 const reg: u4 = @intCast(i);
                 const access: @TypeOf(cpu.bus.*).Access = if (first) .nonseq else .seq;
-                first = false;
                 const aligned_cur = cur & ~@as(u32, 3);
                 if (L) {
-                    cpu.r[reg] = cpu.bus.readTimed(u32, aligned_cur, access);
+                    const value = cpu.bus.readTimed(u32, aligned_cur, access);
+                    // NBA: writeback to base register on the FIRST iteration,
+                    // BEFORE loading the destination. So if base is in the
+                    // list AND base == reg, the load wins (writeback gets
+                    // overwritten).
+                    if (W and first) {
+                        cpu.r[rn] = base_new;
+                        if (rn == 15) cpu.reloadPipeline();
+                    }
+                    cpu.r[reg] = value;
                     if (reg == 15) {
                         if (S) restoreCpsrFromSpsr(cpu);
                         cpu.reloadPipeline();
@@ -586,14 +596,13 @@ pub fn blockTransferHandler(comptime top: u8) decode.ArmFn {
                     var v = cpu.r[reg];
                     if (reg == 15) v +%= 4;
                     cpu.bus.writeTimed(u32, aligned_cur, access, v);
+                    if (W and first) {
+                        cpu.r[rn] = base_new;
+                        if (rn == 15) cpu.reloadPipeline();
+                    }
                 }
+                first = false;
                 cur +%= 4;
-            }
-
-            const base_new = if (list == 0) addr +% (if (U) @as(u32, 0x40) else @as(u32, 0) -% 0x40) else end_addr;
-            if (W) {
-                cpu.r[rn] = base_new;
-                if (rn == 15) cpu.reloadPipeline();
             }
 
             // Restore mode if we switched to user.
@@ -609,7 +618,11 @@ pub fn blockTransferHandler(comptime top: u8) decode.ArmFn {
 // =====================================================================
 
 pub fn mulLongHandler(comptime uas: u3) decode.ArmFn {
-    const unsigned = (uas & 0b100) != 0;
+    // NBA mapping: bit 22 = sign_extend (set → signed multiply).
+    // Our `uas` packs bits 22..20 = U/A/S. Bit 22 (uas bit 2) IS the
+    // sign-extend flag, NOT an "unsigned" flag despite the GBATEK
+    // naming convention some references use.
+    const sign_extend = (uas & 0b100) != 0;
     const accumulate = (uas & 0b010) != 0;
     const set_flags = (uas & 0b001) != 0;
     return struct {
@@ -626,15 +639,14 @@ pub fn mulLongHandler(comptime uas: u3) decode.ArmFn {
 
             const lhs = cpu.r[rm];
             const rhs = cpu.r[rs];
-            const product: u64 = if (unsigned)
-                @as(u64, lhs) *% @as(u64, rhs)
-            else blk: {
+            const product: u64 = if (sign_extend) blk: {
                 const a: i64 = @as(i32, @bitCast(lhs));
                 const b: i64 = @as(i32, @bitCast(rhs));
                 break :blk @bitCast(a *% b);
-            };
+            } else
+                @as(u64, lhs) *% @as(u64, rhs);
 
-            _ = tickMultiply(cpu, !unsigned, rhs);
+            _ = tickMultiply(cpu, sign_extend, rhs);
             cpu.bus.wait_cycles_accum +%= 1; // unconditional bus.Idle() after mul
 
             var result: u64 = product;
@@ -1026,6 +1038,47 @@ test "SUBS PC, LR, #0 restores CPSR from SPSR (exception return)" {
     handler(&cpu, 0xE25E_F000);
     try std.testing.expectEqual(@as(u5, @intFromEnum(cpu_mod.Mode.user)), cpu.cpsr.mode);
     try std.testing.expect(cpu.cpsr.thumb);
+}
+
+test "SMULL r2, r3, r0, r1 with -1 × -1" {
+    // bit 22 = 1 = SIGNED multiplication (per NBA's gen_arm.hh).
+    // SMULL of (-1) * (-1) signed = 1. Low: 1, High: 0.
+    var bus: Bus = .{};
+    var cpu = Cpu.init(&bus);
+    cpu.r[0] = 0xFFFF_FFFF;
+    cpu.r[1] = 0xFFFF_FFFF;
+    // SMULL r2, r3, r0, r1: cond=AL, 0001_110_S, uas=0b110 → SMULL no-flags
+    // Actually that's signed-mlal. SMULL with no accumulate = uas=0b100 (bit 22).
+    // Encoding 0xE0C32190 has bit 22 = 1 = SIGNED.
+    const handler = comptime mulLongHandler(0b100);
+    handler(&cpu, 0xE0C3_2190);
+    try std.testing.expectEqual(@as(u32, 0x0000_0001), cpu.r[2]);
+    try std.testing.expectEqual(@as(u32, 0x0000_0000), cpu.r[3]);
+}
+
+test "UMULL r2, r3, r0, r1 with 0xFFFFFFFF × 0xFFFFFFFF" {
+    // bit 22 = 0 = UNSIGNED. UMULL of large values.
+    var bus: Bus = .{};
+    var cpu = Cpu.init(&bus);
+    cpu.r[0] = 0xFFFF_FFFF;
+    cpu.r[1] = 0xFFFF_FFFF;
+    // UMULL: uas = 0b000 (bit 22 clear)
+    // Encoding pattern (bits 23-20 = 1000): 0xE0832190
+    const handler = comptime mulLongHandler(0b000);
+    handler(&cpu, 0xE083_2190);
+    try std.testing.expectEqual(@as(u32, 0x0000_0001), cpu.r[2]);
+    try std.testing.expectEqual(@as(u32, 0xFFFF_FFFE), cpu.r[3]);
+}
+
+test "CMN r3, #2 with r3 = 0xFFFFFFFE sets Z=1" {
+    // This is the encoding the test runner uses for `cmp r3, -2`.
+    // CMN: opcode=0xB, S=1. With imm: I=1, top = 0011_0111 = 0x37 (I=1, op=0xB, S=1).
+    var bus: Bus = .{};
+    var cpu = Cpu.init(&bus);
+    cpu.r[3] = 0xFFFF_FFFE;
+    const handler = comptime dataProcHandler(0x37, 0);
+    handler(&cpu, 0xE373_0002);
+    try std.testing.expect(cpu.cpsr.zero);
 }
 
 test "STR/LDR word round-trip" {

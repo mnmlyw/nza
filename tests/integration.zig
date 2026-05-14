@@ -107,13 +107,14 @@ fn dumpFramebufferPpm(path: [:0]const u8, fb: *const [FB_LEN]u32) !void {
 test "arm.gba" {
     const result = (try runRom("arm.gba", DEFAULT_FRAMES)) orelse return;
     std.debug.print("[run] arm.gba    hash=0x{x:0>16} pc=0x{x:0>8}\n", .{ result.framebuffer_hash, result.last_pc });
-    // TODO: once verified pass on real hardware, lock the golden:
-    // try std.testing.expectEqual(@as(u64, 0x...), result.framebuffer_hash);
+    // All-pass framebuffer (matches nes.gba's "everything green" screen).
+    try std.testing.expectEqual(@as(u64, 0xe5ab36d2fca96065), result.framebuffer_hash);
 }
 
 test "thumb.gba" {
     const result = (try runRom("thumb.gba", DEFAULT_FRAMES)) orelse return;
     std.debug.print("[run] thumb.gba  hash=0x{x:0>16} pc=0x{x:0>8}\n", .{ result.framebuffer_hash, result.last_pc });
+    try std.testing.expectEqual(@as(u64, 0xe5ab36d2fca96065), result.framebuffer_hash);
 }
 
 
