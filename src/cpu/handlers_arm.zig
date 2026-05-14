@@ -187,102 +187,96 @@ pub fn dataProcHandler(comptime top: u8, comptime low: u4) decode.ArmFn {
     const I = (top & 0b0010_0000) != 0;
     const opcode: u4 = @intCast((top >> 1) & 0xF);
     const set_flags = (top & 1) != 0;
+    // For shift-by-register data-proc, the ARM7TDMI spends one extra
+    // internal cycle and reads PC as PC+12 (instead of PC+8). NBA models
+    // this by bumping `state.r15 += 4` BEFORE reading op1/op2 and
+    // suppressing the auto-advance at the end of the handler. We mirror
+    // that exactly: bump cpu.r[15] in the handler, set `branched=true`
+    // so `step()` won't add another +4.
     return struct {
         fn handler(cpu: *Cpu, instr: u32) void {
             const rn: u4 = @intCast((instr >> 16) & 0xF);
             const rd: u4 = @intCast((instr >> 12) & 0xF);
 
-            // Decode operand2.
+            var op1: u32 = undefined;
             var op2: u32 = undefined;
-            var carry_out: bool = cpu.cpsr.carry;
+            var carry: bool = cpu.cpsr.carry;
 
             if (I) {
-                const imm: u32 = instr & 0xFF;
-                const rot_amt: u32 = ((instr >> 8) & 0xF) * 2;
-                if (rot_amt == 0) {
-                    op2 = imm;
+                const value: u32 = instr & 0xFF;
+                const shift: u32 = ((instr >> 8) & 0xF) * 2;
+                if (shift != 0) {
+                    carry = ((value >> @intCast(shift - 1)) & 1) != 0;
+                    op2 = std.math.rotr(u32, value, @as(u5, @intCast(shift)));
                 } else {
-                    op2 = std.math.rotr(u32, imm, @as(u5, @intCast(rot_amt)));
-                    carry_out = (op2 >> 31) & 1 == 1;
+                    op2 = value;
                 }
+                op1 = cpu.r[rn];
             } else {
-                const rm: u4 = @intCast(instr & 0xF);
-                const shift_type: u2 = @intCast((instr >> 5) & 3);
-                const shift_by_reg = (instr >> 4) & 1 != 0;
-                var rm_val = cpu.r[rm];
-                var shift_amt: u32 = undefined;
-                if (shift_by_reg) {
-                    // Reading PC after a shift-by-reg sees PC+12 (one extra
-                    // cycle vs. shift-by-imm because of an extra register read).
-                    if (rm == 15) rm_val +%= 4;
-                    const rs: u4 = @intCast((instr >> 8) & 0xF);
-                    shift_amt = cpu.r[rs] & 0xFF;
-                    if (shift_amt == 0) {
-                        op2 = rm_val;
-                        // carry_out unchanged
-                        carry_out = cpu.cpsr.carry;
-                    } else {
-                        const r = applyShift(rm_val, shift_type, shift_amt, cpu.cpsr.carry);
-                        op2 = r[0];
-                        carry_out = r[1];
-                    }
+                const shift_imm = ((instr >> 4) & 1) == 0;
+                var shift: u32 = undefined;
+                if (shift_imm) {
+                    shift = (instr >> 7) & 0x1F;
                 } else {
-                    shift_amt = (instr >> 7) & 0x1F;
-                    const r = applyShift(rm_val, shift_type, shift_amt, cpu.cpsr.carry);
-                    op2 = r[0];
-                    carry_out = r[1];
+                    shift = cpu.r[@as(u4, @intCast((instr >> 8) & 0xF))];
+                    // NBA: state.r15 += 4; bus.Idle(); pipe.access = NSeq;
+                    cpu.r[15] +%= 4;
+                    cpu.bus.wait_cycles_accum +%= 1; // I-cycle
+                    cpu.branched = true; // suppress step()'s post-handler +4
                 }
+                op1 = cpu.r[rn];
+                op2 = cpu.r[@as(u4, @intCast(instr & 0xF))];
+                const shift_type: u2 = @intCast((instr >> 5) & 3);
+                const r = doShift(op2, shift_type, shift, carry, shift_imm);
+                op2 = r[0];
+                carry = r[1];
             }
 
-            const rn_val = cpu.r[rn];
             var result: u32 = 0;
             var write_back = true;
             const c_in: u32 = @intFromBool(cpu.cpsr.carry);
             const borrow_in: u32 = @intFromBool(!cpu.cpsr.carry);
 
             switch (opcode) {
-                0x0 => result = rn_val & op2, // AND
-                0x1 => result = rn_val ^ op2, // EOR
-                0x2 => result = rn_val -% op2, // SUB
-                0x3 => result = op2 -% rn_val, // RSB
-                0x4 => result = rn_val +% op2, // ADD
-                0x5 => result = rn_val +% op2 +% c_in, // ADC
-                0x6 => result = rn_val -% op2 -% borrow_in, // SBC
-                0x7 => result = op2 -% rn_val -% borrow_in, // RSC
+                0x0 => result = op1 & op2, // AND
+                0x1 => result = op1 ^ op2, // EOR
+                0x2 => result = op1 -% op2, // SUB
+                0x3 => result = op2 -% op1, // RSB
+                0x4 => result = op1 +% op2, // ADD
+                0x5 => result = op1 +% op2 +% c_in, // ADC
+                0x6 => result = op1 -% op2 -% borrow_in, // SBC
+                0x7 => result = op2 -% op1 -% borrow_in, // RSC
                 0x8 => { // TST
-                    result = rn_val & op2;
+                    result = op1 & op2;
                     write_back = false;
                 },
                 0x9 => { // TEQ
-                    result = rn_val ^ op2;
+                    result = op1 ^ op2;
                     write_back = false;
                 },
                 0xA => { // CMP
-                    result = rn_val -% op2;
+                    result = op1 -% op2;
                     write_back = false;
                 },
                 0xB => { // CMN
-                    result = rn_val +% op2;
+                    result = op1 +% op2;
                     write_back = false;
                 },
-                0xC => result = rn_val | op2, // ORR
+                0xC => result = op1 | op2, // ORR
                 0xD => result = op2, // MOV
-                0xE => result = rn_val & ~op2, // BIC
+                0xE => result = op1 & ~op2, // BIC
                 0xF => result = ~op2, // MVN
             }
 
             if (set_flags and rd != 15) {
-                // Normal flag-setting path. The "rd=15 and S=1" form is the
-                // exception-return idiom (e.g. SUBS PC, LR, #4) and goes
-                // through restoreCpsrFromSpsr below instead.
                 switch (opcode) {
-                    0x0, 0x1, 0x8, 0x9, 0xC, 0xD, 0xE, 0xF => setLogicalFlags(cpu, result, carry_out),
-                    0x2, 0xA => setArithFlags(cpu, rn_val, op2, result, true),
-                    0x3 => setArithFlags(cpu, op2, rn_val, result, true),
-                    0x4, 0xB => setArithFlags(cpu, rn_val, op2, result, false),
-                    0x5 => setAdcFlags(cpu, rn_val, op2, c_in, result),
-                    0x6 => setSbcFlags(cpu, rn_val, op2, borrow_in, result),
-                    0x7 => setSbcFlags(cpu, op2, rn_val, borrow_in, result),
+                    0x0, 0x1, 0x8, 0x9, 0xC, 0xD, 0xE, 0xF => setLogicalFlags(cpu, result, carry),
+                    0x2, 0xA => setArithFlags(cpu, op1, op2, result, true),
+                    0x3 => setArithFlags(cpu, op2, op1, result, true),
+                    0x4, 0xB => setArithFlags(cpu, op1, op2, result, false),
+                    0x5 => setAdcFlags(cpu, op1, op2, c_in, result),
+                    0x6 => setSbcFlags(cpu, op1, op2, borrow_in, result),
+                    0x7 => setSbcFlags(cpu, op2, op1, borrow_in, result),
                 }
             }
 
@@ -295,6 +289,83 @@ pub fn dataProcHandler(comptime top: u8, comptime low: u4) decode.ArmFn {
             }
         }
     }.handler;
+}
+
+/// Port of NBA's `DoShift`. Applies one of LSL/LSR/ASR/ROR/RRX to
+/// `value`, in place, and updates the carry-out flag. `immediate`
+/// signals whether the shift amount came from an immediate (in which
+/// case ASR/LSR/ROR have special-case semantics for shift=0).
+fn doShift(value: u32, shift_type: u2, amount: u32, carry_in: bool, immediate: bool) struct { u32, bool } {
+    var v = value;
+    var c = carry_in;
+    switch (shift_type) {
+        0 => { // LSL
+            if (amount == 0) return .{ v, c };
+            if (amount >= 32) {
+                c = if (amount == 32) (v & 1) != 0 else false;
+                return .{ 0, c };
+            }
+            const sh: u5 = @intCast(amount);
+            c = ((v >> @intCast(32 - amount)) & 1) != 0;
+            v = v << sh;
+            return .{ v, c };
+        },
+        1 => { // LSR
+            if (amount == 0) {
+                if (immediate) {
+                    // LSR #0 means LSR #32.
+                    c = (v >> 31) & 1 == 1;
+                    return .{ 0, c };
+                }
+                return .{ v, c };
+            }
+            if (amount >= 32) {
+                c = if (amount == 32) ((v >> 31) & 1) != 0 else false;
+                return .{ 0, c };
+            }
+            const sh: u5 = @intCast(amount);
+            c = ((v >> @intCast(amount - 1)) & 1) != 0;
+            v = v >> sh;
+            return .{ v, c };
+        },
+        2 => { // ASR
+            if (amount == 0 or amount >= 32) {
+                if (immediate or amount >= 32) {
+                    const sign = (v & 0x8000_0000) != 0;
+                    c = sign;
+                    v = if (sign) 0xFFFF_FFFF else 0;
+                    return .{ v, c };
+                }
+                return .{ v, c };
+            }
+            const sh: u5 = @intCast(amount);
+            c = ((v >> @intCast(amount - 1)) & 1) != 0;
+            v = @bitCast(@as(i32, @bitCast(v)) >> sh);
+            return .{ v, c };
+        },
+        3 => { // ROR / RRX
+            if (amount == 0) {
+                if (immediate) {
+                    // RRX (ROR #0 immediate): rotate right by 1 through carry.
+                    const new_c = (v & 1) != 0;
+                    v = (v >> 1) | (@as(u32, @intFromBool(c)) << 31);
+                    return .{ v, new_c };
+                }
+                return .{ v, c };
+            }
+            // ROR by amount mod 32 (when amount>0); when amount % 32 == 0
+            // and amount != 0, carry = bit 31 of v, value unchanged.
+            const m: u32 = amount & 31;
+            if (m == 0) {
+                c = (v >> 31) & 1 == 1;
+                return .{ v, c };
+            }
+            const sh: u5 = @intCast(m);
+            v = std.math.rotr(u32, v, sh);
+            c = (v >> 31) & 1 == 1;
+            return .{ v, c };
+        },
+    }
 }
 
 /// Exception-return CPSR restore.
