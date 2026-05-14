@@ -22,8 +22,9 @@ house with correct rendering and audio.
 | M3.3 | Real GPIO + Seiko S-3511A RTC + Solar (Boktai) + Rumble detection | done |
 | M3.4 | MUL/MLA I-cycles + vertical mosaic + per-scanline OAM budget + PPU bus contention | done |
 | M3.5 | jsmolka bugfix sweep — 3 known instruction-level failures, deferred (see below) | partial |
+| M4.0 | GameShark / Action Replay / CodeBreaker cheat-code engine | done |
 
-~7100 LOC. 48/48 unit tests + 4/4 integration tests passing.
+~7250 LOC. 51/51 unit tests + 4/4 integration tests passing.
 
 ## What works
 
@@ -70,8 +71,9 @@ house with correct rendering and audio.
   - `memory.gba` test 050 — unaligned LDR/LDM rotation edge
 - **Some Pokémon audio specifics.** M4A song-transition stall still open
   (task #12). PSG channel 3 wave pattern bank-switch edge case.
-- **Multiplayer link cable / SIO**, **cheat codes**, **JIT recompiler**,
-  **wireless adapter** — out of M3 scope; tracked for M4+.
+- **Multiplayer link cable / SIO**, **wireless adapter**, **JIT
+  recompiler** — multi-week individual undertakings; deferred to M5+.
+- **gdbserver stub** for live debugging — planned (M4.2).
 - **GamePak DRQ / Video Capture special-DMA** — niche corner cases.
 
 ## Build
