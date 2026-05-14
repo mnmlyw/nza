@@ -19,6 +19,7 @@ const Args = struct {
     /// Multiple inputs comma-separated: e.g. `start@8500,a@9200`.
     press_script: ?[]const u8 = null,
     snapshot_test: bool = false,
+    gdb_port: ?u16 = null,
 };
 
 fn parseArgs(init: std.process.Init.Minimal) !Args {
@@ -44,6 +45,9 @@ fn parseArgs(init: std.process.Init.Minimal) !Args {
             args.press_script = it.next() orelse return error.MissingPressValue;
         } else if (std.mem.eql(u8, arg, "--snapshot-test")) {
             args.snapshot_test = true;
+        } else if (std.mem.eql(u8, arg, "--gdbserver")) {
+            const v = it.next() orelse return error.MissingGdbPortValue;
+            args.gdb_port = std.fmt.parseInt(u16, v, 10) catch return error.BadGdbPortValue;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("unknown flag: {s}\n", .{arg});
             return error.UnknownFlag;
@@ -187,6 +191,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return;
     }
 
+    // Optional GDB remote-serial-protocol stub.
+    const gdb_mod = @import("core/gdbserver.zig");
+    var gdb: ?gdb_mod.GdbServer = if (args.gdb_port) |p| gdb_mod.GdbServer.init(p) else null;
+    defer if (gdb) |*g| g.deinit();
+
     var fe = try sdl.Frontend.init();
     defer fe.deinit();
 
@@ -233,9 +242,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
         } else if (args.ppu_test) {
             core.runFrameNoCpu();
         } else {
-            const frames: u8 = if (fast_forward) 4 else 1;
-            var k: u8 = 0;
-            while (k < frames) : (k += 1) core.runFrame();
+            const run = if (gdb) |*g| g.pump(core) else true;
+            if (run) {
+                const frames: u8 = if (fast_forward) 4 else 1;
+                var k: u8 = 0;
+                while (k < frames) : (k += 1) core.runFrame();
+            }
+            if (gdb) |*g| g.afterStep();
         }
         fe.present(&core.ppu.framebuffer);
         if (!fast_forward) _ = fe.pushAudio(&core.apu);
@@ -370,6 +383,7 @@ test {
     _ = @import("core/eeprom.zig");
     _ = @import("core/gpio.zig");
     _ = @import("core/cheats.zig");
+    _ = @import("core/gdbserver.zig");
     _ = @import("core/snapshot.zig");
     _ = @import("frontend/config.zig");
     _ = @import("apu/apu.zig");
