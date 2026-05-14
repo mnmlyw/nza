@@ -16,8 +16,14 @@ house with correct rendering and audio.
 | M2.1 | CPU cycle accuracy + WAITCNT-driven cart/SRAM wait tables + LDM N+S timing | done |
 | M2.2 | Layered PPU compositor: alpha blend + windows + mosaic + affine BG internal ref | done |
 | M2.3 | Affine sprite rotation/scaling matrix + double-size bounding box | done |
+| M3.0 | Persistent `.sav` file (SRAM/Flash/EEPROM) + EEPROM 4K/64K chip | done |
+| M3.1 | TLV save states + rewind ring (6s) + fast-forward toggle | done |
+| M3.2 | SDL_GameController + audio low-pass + configurable controls via config.ini | done |
+| M3.3 | Real GPIO + Seiko S-3511A RTC + Solar (Boktai) + Rumble detection | done |
+| M3.4 | MUL/MLA I-cycles + vertical mosaic + per-scanline OAM budget + PPU bus contention | done |
+| M3.5 | jsmolka bugfix sweep — 3 known instruction-level failures, deferred (see below) | partial |
 
-~5300 LOC. 44/44 unit tests + 4/4 integration tests passing.
+~7100 LOC. 48/48 unit tests + 4/4 integration tests passing.
 
 ## What works
 
@@ -53,22 +59,20 @@ house with correct rendering and audio.
 
 ## What doesn't (yet)
 
-- **Cart-ROM prefetch buffer.** WAITCNT.14 (prefetch enable) is read but
-  the actual prefetch FIFO isn't modelled, so games that rely on it for
-  perfect timing run slightly slower than real hardware.
-- **Mul/Mla I-cycle counts.** Multiplier operands' top-byte zero-detect
-  isn't used to compute the variable internal-cycle count.
-- **Vertical mosaic.** Horizontal mosaic is implemented; vertical would
-  need per-scanline result caching.
-- **Per-scanline OAM cycle budget.** Sprite rendering doesn't currently
-  drop sprites when the per-line OAM cycle limit is hit.
-- **PRAM/VRAM/OAM bus contention** stalling the CPU during PPU access.
-- **RTC chip.** Cart GPIO is gated but no RTC logic — Pokémon Emerald's
-  berry / Mirage Island features are inert; boot/play is unaffected.
-- **Some Pokémon audio specifics.** M4A song-transition still rough
-  (task #12). PSG channels 1-4 wired but minimally tested for accuracy.
-- **EEPROM** save chips; **Save-state and rewind**; **Configurable
-  controls**, **debugger UI**, **multiplayer link cable**.
+- **Cart-ROM prefetch buffer.** WAITCNT.14 (prefetch enable) is honored
+  but the speculative-fetch FIFO state machine isn't modelled, so games
+  that depend on it for tight timing run slightly slower than real
+  hardware. (Performance accuracy, not correctness.)
+- **Three jsmolka instruction-level test failures.**
+  - `arm.gba` test 225 — undetermined; suspected MUL/long-MUL flag edge
+  - `thumb.gba` — CPU enters a code path that bounces ARM↔Thumb early
+    and never resyncs (likely a PUSH/POP corner case the test exercises)
+  - `memory.gba` test 050 — unaligned LDR/LDM rotation edge
+- **Some Pokémon audio specifics.** M4A song-transition stall still open
+  (task #12). PSG channel 3 wave pattern bank-switch edge case.
+- **Multiplayer link cable / SIO**, **cheat codes**, **JIT recompiler**,
+  **wireless adapter** — out of M3 scope; tracked for M4+.
+- **GamePak DRQ / Video Capture special-DMA** — niche corner cases.
 
 ## Build
 
@@ -103,6 +107,8 @@ location: `~/Documents/gba/gba_bios.bin`.
 
 ## Controls
 
+Default keys (override in `~/.config/nza/config.ini`):
+
 | GBA button | Key |
 |---|---|
 | A | `Z` |
@@ -113,6 +119,20 @@ location: `~/Documents/gba/gba_bios.bin`.
 | Select | `Shift` (left or right) |
 | D-pad | Arrow keys |
 | Quit | `Esc` |
+
+Hotkeys:
+
+| Key | Function |
+|---|---|
+| `F1` | Save state to `<rom>.state` |
+| `F2` | Load state from `<rom>.state` |
+| `F11` | Toggle fullscreen |
+| `F12` | Screenshot to `/tmp/nza.ppm` |
+| `Tab` | Toggle fast-forward (4×) |
+| `Backspace` | Rewind (hold) — ~6 s history |
+
+Game controllers are detected at startup; `controller.<button>` in
+`config.ini` overrides the default button layout.
 
 ## Layout
 
