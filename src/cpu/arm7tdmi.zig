@@ -99,6 +99,12 @@ pub const Cpu = struct {
     /// more complete than our HLE).
     hle_swi: bool = false,
 
+    /// IRQ disable bit *as of the start of the currently-executing
+    /// instruction*. NBA-style: an MSR that toggles IRQ disable doesn't
+    /// take effect until the NEXT instruction. The runFrame loop checks
+    /// this latched value, not the live cpsr.irq_disable.
+    latch_irq_disable: bool = true,
+
     pub fn init(bus: *Bus) Cpu {
         var cpu = Cpu{ .bus = bus };
         // Real GBA boots at 0x00000000 (BIOS reset vector) in ARM mode, SVC,
@@ -148,6 +154,10 @@ pub const Cpu = struct {
     pub fn step(self: *Cpu) void {
         self.branched = false;
         self.bus.wait_cycles_accum = 0;
+        // Latch IRQ disable bit at instruction boundary (NBA behavior:
+        // MSR cpsr_c that disables IRQ doesn't take effect until next
+        // instruction).
+        self.latch_irq_disable = self.cpsr.irq_disable;
         if (self.cpsr.thumb) {
             const instr: u16 = @truncate(self.pipeline[0]);
             self.pipeline[0] = self.pipeline[1];

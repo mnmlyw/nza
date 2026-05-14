@@ -363,8 +363,11 @@ pub const Core = struct {
     pub fn runFrame(self: *Core) void {
         const target = self.scheduler.now() + CYCLES_PER_FRAME;
         while (self.scheduler.now() < target) {
-            // Service pending IRQ (CPU-side check matches ARM7TDMI semantics).
-            if (self.irq.pending() != 0 and self.irq.ime and !self.cpu.cpsr.irq_disable) {
+            // Service pending IRQ. NBA-style: use the latched IRQ-disable
+            // bit from the previous instruction boundary, not the live one
+            // — so an MSR that disables IRQ doesn't take effect until the
+            // *next* instruction. Tests like jsmolka's irq.gba expect this.
+            if (self.irq.pending() != 0 and self.irq.ime and !self.cpu.latch_irq_disable) {
                 arm_handlers.enterException(&self.cpu, .irq, 0x18, 4);
                 self.irq_entry_count += 1;
             }
