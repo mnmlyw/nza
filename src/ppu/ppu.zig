@@ -28,8 +28,8 @@ pub const CYCLES_PER_SCANLINE: u64 = CYCLES_PER_HDRAW + CYCLES_PER_HBLANK;
 pub const VBLANK_FIRST_LINE: u16 = 160;
 pub const TOTAL_LINES: u16 = 228;
 
-const TAG_HDRAW_END: u32 = 0x1000;
-const TAG_HBLANK_END: u32 = 0x1001;
+pub const TAG_HDRAW_END: u32 = 0x1000;
+pub const TAG_HBLANK_END: u32 = 0x1001;
 
 /// Per-pixel layer state. Each BG renderer writes one of these to its
 /// layer buffer; the compositor reads them at end of scanline.
@@ -76,7 +76,7 @@ pub const Ppu = struct {
         self.sched.schedule(CYCLES_PER_HDRAW, onHdrawEnd, self, TAG_HDRAW_END);
     }
 
-    fn onHdrawEnd(ctx: *anyopaque, late: u64) void {
+    pub fn onHdrawEnd(ctx: *anyopaque, late: u64) void {
         _ = late;
         const self: *Ppu = @ptrCast(@alignCast(ctx));
 
@@ -103,7 +103,7 @@ pub const Ppu = struct {
         self.sched.schedule(CYCLES_PER_HBLANK, onHblankEnd, self, TAG_HBLANK_END);
     }
 
-    fn onHblankEnd(ctx: *anyopaque, late: u64) void {
+    pub fn onHblankEnd(ctx: *anyopaque, late: u64) void {
         _ = late;
         const self: *Ppu = @ptrCast(@alignCast(ctx));
 

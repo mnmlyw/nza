@@ -95,10 +95,17 @@ const SDL_KEYUP: u32 = 0x301;
 const SDLK_ESCAPE: i32 = 27;
 const SDLK_RETURN: i32 = 13;
 const SDLK_SPACE: i32 = 32;
+const SDLK_TAB: i32 = 9;
+const SDLK_BACKSPACE: i32 = 8;
 const SDLK_a: i32 = 97;
 const SDLK_s: i32 = 115;
 const SDLK_x: i32 = 120;
 const SDLK_z: i32 = 122;
+// SDLK function keys: F1..F12 = 0x4000003A..0x40000045.
+const SDLK_F1: i32 = 0x4000003A;
+const SDLK_F2: i32 = 0x4000003B;
+const SDLK_F11: i32 = 0x40000044;
+const SDLK_F12: i32 = 0x40000045;
 // Arrows and shift use scancodes shifted into the upper range — easier to
 // match on the scancode directly.
 const SDL_SCANCODE_RIGHT: c_int = 79;
@@ -115,12 +122,25 @@ pub const Error = error{
     SdlTexture,
 };
 
+/// Non-gameplay key events surfaced to the main loop.
+pub const HotKeyEvent = enum {
+    none,
+    save_state,
+    load_state,
+    fast_forward_toggle,
+    rewind_press,
+    rewind_release,
+    fullscreen_toggle,
+    screenshot,
+};
+
 pub const Frontend = struct {
     window: *SDL_Window,
     renderer: *SDL_Renderer,
     texture: *SDL_Texture,
     audio_dev: u32 = 0,
     audio_buf: [4096]i16 = [_]i16{0} ** 4096,
+    fullscreen: bool = false,
 
     pub fn init() Error!Frontend {
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) return error.SdlInit;
@@ -204,8 +224,10 @@ pub const Frontend = struct {
     }
 
     /// Pump SDL events; update `keypad` for any GBA buttons that are pressed
-    /// or released. Returns false when the user requests quit.
-    pub fn pollEvents(self: *Frontend, keypad: *Keypad) bool {
+    /// or released. `out_hotkeys` receives non-gameplay key events (F1/F2/Tab
+    /// etc.) for the main loop to dispatch. Returns false when the user
+    /// requests quit.
+    pub fn pollEvents(self: *Frontend, keypad: *Keypad, out_hotkeys: *std.ArrayList(HotKeyEvent), allocator: std.mem.Allocator) bool {
         _ = self;
         var ev: SDL_Event = undefined;
         while (SDL_PollEvent(&ev) != 0) {
@@ -214,6 +236,10 @@ pub const Frontend = struct {
                 SDL_KEYDOWN, SDL_KEYUP => {
                     const down = ev.type == SDL_KEYDOWN;
                     if (down and ev.key.keysym.sym == SDLK_ESCAPE) return false;
+                    if (mapHotKey(ev.key.keysym.sym, down)) |hk| {
+                        out_hotkeys.append(allocator, hk) catch {};
+                        continue;
+                    }
                     if (mapKey(ev.key.keysym.sym, ev.key.keysym.scancode)) |b| {
                         if (down) keypad.press(b) else keypad.release(b);
                     }
@@ -223,7 +249,27 @@ pub const Frontend = struct {
         }
         return true;
     }
+
+    pub fn toggleFullscreen(self: *Frontend) void {
+        self.fullscreen = !self.fullscreen;
+        const flag: u32 = if (self.fullscreen) 0x1001 else 0; // SDL_WINDOW_FULLSCREEN_DESKTOP
+        _ = SDL_SetWindowFullscreen(self.window, flag);
+    }
 };
+
+extern fn SDL_SetWindowFullscreen(window: *SDL_Window, flags: u32) c_int;
+
+fn mapHotKey(sym: i32, down: bool) ?HotKeyEvent {
+    return switch (sym) {
+        SDLK_F1 => if (down) HotKeyEvent.save_state else null,
+        SDLK_F2 => if (down) HotKeyEvent.load_state else null,
+        SDLK_F11 => if (down) HotKeyEvent.fullscreen_toggle else null,
+        SDLK_F12 => if (down) HotKeyEvent.screenshot else null,
+        SDLK_TAB => if (down) HotKeyEvent.fast_forward_toggle else null,
+        SDLK_BACKSPACE => if (down) HotKeyEvent.rewind_press else HotKeyEvent.rewind_release,
+        else => null,
+    };
+}
 
 fn mapKey(sym: i32, scancode: c_int) ?Button {
     // Keysym mapping for ASCII letters; scancode for arrows + modifiers.

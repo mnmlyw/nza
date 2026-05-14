@@ -19,7 +19,7 @@ const Apu = @import("../apu/apu.zig").Apu;
 
 const PRESCALER_SHIFTS: [4]u6 = .{ 0, 6, 8, 10 }; // /1, /64, /256, /1024
 
-const TAG_BASE: u32 = 0x2000;
+pub const TAG_BASE: u32 = 0x2000;
 
 pub const Timer = struct {
     reload: u16 = 0,
@@ -130,22 +130,22 @@ pub const Timers = struct {
         self.scheduleOverflow(idx);
     }
 
-    fn onOverflow0(ctx: *anyopaque, late: u64) void {
+    pub fn onOverflow0(ctx: *anyopaque, late: u64) void {
         _ = late;
         const self: *Timers = @ptrCast(@alignCast(ctx));
         self.fireOverflow(0);
     }
-    fn onOverflow1(ctx: *anyopaque, late: u64) void {
+    pub fn onOverflow1(ctx: *anyopaque, late: u64) void {
         _ = late;
         const self: *Timers = @ptrCast(@alignCast(ctx));
         self.fireOverflow(1);
     }
-    fn onOverflow2(ctx: *anyopaque, late: u64) void {
+    pub fn onOverflow2(ctx: *anyopaque, late: u64) void {
         _ = late;
         const self: *Timers = @ptrCast(@alignCast(ctx));
         self.fireOverflow(2);
     }
-    fn onOverflow3(ctx: *anyopaque, late: u64) void {
+    pub fn onOverflow3(ctx: *anyopaque, late: u64) void {
         _ = late;
         const self: *Timers = @ptrCast(@alignCast(ctx));
         self.fireOverflow(3);

@@ -11,6 +11,10 @@ const bios = @import("bios.zig");
 const flash_mod = @import("flash.zig");
 const eeprom_mod = @import("eeprom.zig");
 const save_file = @import("save_file.zig");
+const snapshot = @import("snapshot.zig");
+const ppu_mod = @import("../ppu/ppu.zig");
+const apu_mod = @import("../apu/apu.zig");
+const timer_mod = @import("../timer/timer.zig");
 const Irq = @import("../irq/irq.zig").Irq;
 const Keypad = @import("../keypad/keypad.zig").Keypad;
 const Ppu = @import("../ppu/ppu.zig").Ppu;
@@ -37,6 +41,20 @@ pub const Core = struct {
     eeprom: ?eeprom_mod.Eeprom = null,
     irq_entry_count: u64 = 0,
     frames_run: u64 = 0,
+
+    /// 1 = real-time. Higher values skip audio queue and run multiple
+    /// frames per host iteration (fast-forward).
+    run_speed_mul: u8 = 1,
+
+    /// Rewind ring buffer of recent snapshots. Allocated on demand.
+    rewind_ring: [REWIND_SLOTS]?[]u8 = [_]?[]u8{null} ** REWIND_SLOTS,
+    rewind_head: usize = 0,
+    rewind_count: usize = 0,
+    rewind_frame_skip: u8 = 0,
+    rewind_enabled: bool = false,
+
+    pub const REWIND_SLOTS: usize = 30; // ~6 s at 12-frame snapshot cadence
+    pub const REWIND_FRAME_INTERVAL: u8 = 12;
 
     pub fn init(allocator: std.mem.Allocator) !*Core {
         const self = try allocator.create(Core);
@@ -76,7 +94,108 @@ pub const Core = struct {
     pub fn deinit(self: *Core) void {
         self.flushSaveIfDirty();
         if (self.cart) |*c| c.deinit(self.allocator);
+        for (&self.rewind_ring) |*slot| {
+            if (slot.*) |s| self.allocator.free(s);
+            slot.* = null;
+        }
         self.allocator.destroy(self);
+    }
+
+    /// Allocate a fresh snapshot of the entire core state. Caller owns.
+    pub fn saveState(self: *Core) ![]u8 {
+        return snapshot.save(self.allocator, self);
+    }
+
+    /// Restore from a snapshot blob. ROM/BIOS must already be loaded.
+    pub fn loadState(self: *Core, bytes: []const u8) !void {
+        try snapshot.restore(self, bytes);
+    }
+
+    /// Write a snapshot to `<rom_path>.state`.
+    pub fn saveStateToFile(self: *Core) !void {
+        const c = self.cart orelse return error.NoCart;
+        const rom_path = c.save_path orelse return error.NoPath;
+        // rom_path ends with ".sav"; swap to ".state".
+        const slen = rom_path.len - 4;
+        var p = try self.allocator.alloc(u8, slen + 6);
+        defer self.allocator.free(p);
+        @memcpy(p[0..slen], rom_path[0..slen]);
+        @memcpy(p[slen..], ".state");
+        const bytes = try self.saveState();
+        defer self.allocator.free(bytes);
+        try save_file.flush(self.allocator, p, bytes);
+    }
+
+    /// Read `<rom_path>.state` and restore.
+    pub fn loadStateFromFile(self: *Core) !void {
+        const c = self.cart orelse return error.NoCart;
+        const rom_path = c.save_path orelse return error.NoPath;
+        const slen = rom_path.len - 4;
+        var p = try self.allocator.alloc(u8, slen + 6);
+        defer self.allocator.free(p);
+        @memcpy(p[0..slen], rom_path[0..slen]);
+        @memcpy(p[slen..], ".state");
+        const file_util = @import("file_util.zig");
+        const bytes = try file_util.readAllAlloc(self.allocator, p, 8 * 1024 * 1024);
+        defer self.allocator.free(bytes);
+        try self.loadState(bytes);
+    }
+
+    /// Reschedule one event by its tag. Called by snapshot restore.
+    pub fn bindSchedulerEvent(self: *Core, tag: u32, delta: u64) void {
+        if (tag == ppu_mod.TAG_HDRAW_END) {
+            self.scheduler.schedule(delta, ppu_mod.Ppu.onHdrawEnd, &self.ppu, tag);
+        } else if (tag == ppu_mod.TAG_HBLANK_END) {
+            self.scheduler.schedule(delta, ppu_mod.Ppu.onHblankEnd, &self.ppu, tag);
+        } else if (tag == apu_mod.TAG_MIX) {
+            self.scheduler.schedule(delta, apu_mod.Apu.onMix, &self.apu, tag);
+        } else if (tag >= timer_mod.TAG_BASE and tag < timer_mod.TAG_BASE + 4) {
+            const idx: u2 = @intCast(tag - timer_mod.TAG_BASE);
+            const handler: *const fn (ctx: *anyopaque, late: u64) void = switch (idx) {
+                0 => &timer_mod.Timers.onOverflow0,
+                1 => &timer_mod.Timers.onOverflow1,
+                2 => &timer_mod.Timers.onOverflow2,
+                3 => &timer_mod.Timers.onOverflow3,
+            };
+            self.scheduler.schedule(delta, handler, &self.timers, tag);
+        }
+        // Unknown tag: silently drop (forward-compat).
+    }
+
+    pub fn setRewindEnabled(self: *Core, on: bool) void {
+        self.rewind_enabled = on;
+        if (!on) {
+            for (&self.rewind_ring) |*slot| {
+                if (slot.*) |s| self.allocator.free(s);
+                slot.* = null;
+            }
+            self.rewind_head = 0;
+            self.rewind_count = 0;
+        }
+    }
+
+    fn pushRewindSlot(self: *Core) void {
+        if (!self.rewind_enabled) return;
+        const bytes = self.saveState() catch return;
+        const slot_idx = self.rewind_head;
+        if (self.rewind_ring[slot_idx]) |old| self.allocator.free(old);
+        self.rewind_ring[slot_idx] = bytes;
+        self.rewind_head = (self.rewind_head + 1) % REWIND_SLOTS;
+        if (self.rewind_count < REWIND_SLOTS) self.rewind_count += 1;
+    }
+
+    pub fn rewindStep(self: *Core) bool {
+        if (self.rewind_count == 0) return false;
+        const newest = (self.rewind_head + REWIND_SLOTS - 1) % REWIND_SLOTS;
+        if (self.rewind_ring[newest]) |bytes| {
+            self.loadState(bytes) catch return false;
+            self.allocator.free(bytes);
+            self.rewind_ring[newest] = null;
+            self.rewind_head = newest;
+            self.rewind_count -= 1;
+            return true;
+        }
+        return false;
     }
 
     pub fn loadBios(self: *Core, path: []const u8) !void {
@@ -246,6 +365,10 @@ pub const Core = struct {
         self.frames_run += 1;
         if (self.frames_run % 60 == 0 and self.bus.save_dirty) {
             self.flushSaveIfDirty();
+        }
+        if (self.rewind_enabled) {
+            self.rewind_frame_skip = (self.rewind_frame_skip + 1) % REWIND_FRAME_INTERVAL;
+            if (self.rewind_frame_skip == 0) self.pushRewindSlot();
         }
     }
 };

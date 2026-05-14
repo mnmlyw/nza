@@ -18,6 +18,7 @@ const Args = struct {
     /// during the headless --steps run. Used to drive past the title.
     /// Multiple inputs comma-separated: e.g. `start@8500,a@9200`.
     press_script: ?[]const u8 = null,
+    snapshot_test: bool = false,
 };
 
 fn parseArgs(init: std.process.Init.Minimal) !Args {
@@ -41,6 +42,8 @@ fn parseArgs(init: std.process.Init.Minimal) !Args {
             args.trace = std.fmt.parseInt(u64, v, 10) catch return error.BadTraceValue;
         } else if (std.mem.eql(u8, arg, "--press")) {
             args.press_script = it.next() orelse return error.MissingPressValue;
+        } else if (std.mem.eql(u8, arg, "--snapshot-test")) {
+            args.snapshot_test = true;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("unknown flag: {s}\n", .{arg});
             return error.UnknownFlag;
@@ -153,6 +156,30 @@ pub fn main(init: std.process.Init.Minimal) !void {
         });
     }
 
+    if (args.snapshot_test) {
+        // 1) Run 60 frames as warm-up.
+        var i: u64 = 0;
+        while (i < 60) : (i += 1) core.runFrame();
+        // 2) Snapshot.
+        const bytes = try core.saveState();
+        defer allocator.free(bytes);
+        std.debug.print("snapshot size: {d} bytes\n", .{bytes.len});
+        // 3) Run 60 more frames, compute hash A.
+        var ia: u64 = 0;
+        while (ia < 60) : (ia += 1) core.runFrame();
+        const hash_a = framebufferHash(&core.ppu.framebuffer);
+        const pc_a = core.cpu.r[15];
+        // 4) Restore, run 60 again, recompute.
+        try core.loadState(bytes);
+        var ib: u64 = 0;
+        while (ib < 60) : (ib += 1) core.runFrame();
+        const hash_b = framebufferHash(&core.ppu.framebuffer);
+        const pc_b = core.cpu.r[15];
+        std.debug.print("snapshot-test: hash_a=0x{x:0>16} hash_b=0x{x:0>16} pc_a=0x{x:0>8} pc_b=0x{x:0>8} match={}\n",
+            .{ hash_a, hash_b, pc_a, pc_b, hash_a == hash_b });
+        return;
+    }
+
     if (args.headless) {
         // Dump current framebuffer to /tmp/nza.ppm so we can see what was
         // rendered headlessly. Audio was streamed during --steps.
@@ -163,14 +190,44 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var fe = try sdl.Frontend.init();
     defer fe.deinit();
 
+    // Rewind is enabled by default; it's cheap and lets Backspace rewind.
+    core.setRewindEnabled(true);
+
+    var hotkeys: std.ArrayList(sdl.HotKeyEvent) = .empty;
+    defer hotkeys.deinit(allocator);
+    var fast_forward: bool = false;
+    var rewind_held: bool = false;
+
     // Main loop: pump SDL events, run one frame of emulation, present.
     // SDL's PRESENTVSYNC paces the loop near 60 Hz. Audio is queued each
     // frame; if the queue grows too large we drop the excess to keep
     // latency bounded.
-    while (fe.pollEvents(&core.keypad)) {
-        if (args.ppu_test) core.runFrameNoCpu() else core.runFrame();
+    while (fe.pollEvents(&core.keypad, &hotkeys, allocator)) {
+        for (hotkeys.items) |hk| switch (hk) {
+            .save_state => core.saveStateToFile() catch |e|
+                std.debug.print("save-state failed: {s}\n", .{@errorName(e)}),
+            .load_state => core.loadStateFromFile() catch |e|
+                std.debug.print("load-state failed: {s}\n", .{@errorName(e)}),
+            .fast_forward_toggle => fast_forward = !fast_forward,
+            .rewind_press => rewind_held = true,
+            .rewind_release => rewind_held = false,
+            .fullscreen_toggle => fe.toggleFullscreen(),
+            .screenshot => dumpFramebufferPpm(&core.ppu.framebuffer) catch {},
+            .none => {},
+        };
+        hotkeys.clearRetainingCapacity();
+
+        if (rewind_held) {
+            _ = core.rewindStep();
+        } else if (args.ppu_test) {
+            core.runFrameNoCpu();
+        } else {
+            const frames: u8 = if (fast_forward) 4 else 1;
+            var k: u8 = 0;
+            while (k < frames) : (k += 1) core.runFrame();
+        }
         fe.present(&core.ppu.framebuffer);
-        _ = fe.pushAudio(&core.apu);
+        if (!fast_forward) _ = fe.pushAudio(&core.apu);
     }
 }
 
@@ -197,6 +254,12 @@ fn applyPressScript(kp: anytype, script: []const u8, frame: u64) void {
         if (frame == start) kp.press(btn);
         if (frame == start + 3) kp.release(btn);
     }
+}
+
+fn framebufferHash(fb: *const [@as(usize, @intCast(sdl.WIDTH * sdl.HEIGHT))]u32) u64 {
+    var h = std.hash.Fnv1a_64.init();
+    h.update(std.mem.sliceAsBytes(fb[0..]));
+    return h.final();
 }
 
 fn dumpFramebufferPpm(fb: *const [@as(usize, @intCast(sdl.WIDTH * sdl.HEIGHT))]u32) !void {
@@ -293,6 +356,8 @@ test {
     _ = @import("core/cart.zig");
     _ = @import("core/core.zig");
     _ = @import("core/flash.zig");
+    _ = @import("core/eeprom.zig");
+    _ = @import("core/snapshot.zig");
     _ = @import("apu/apu.zig");
     _ = @import("apu/psg.zig");
     _ = @import("cpu/arm7tdmi.zig");

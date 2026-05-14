@@ -28,7 +28,7 @@ pub const SAMPLE_RATE: u32 = 32768;
 const MIX_CYCLES: u64 = 16_777_216 / SAMPLE_RATE;
 
 const FIFO_SIZE: usize = 32;
-const TAG_MIX: u32 = 0x3000;
+pub const TAG_MIX: u32 = 0x3000;
 
 /// 32-byte circular byte FIFO. Stores 8-bit signed PCM samples as written
 /// by DMA.
@@ -399,7 +399,7 @@ pub const Apu = struct {
         return OUT_RING - self.out_head + self.out_tail;
     }
 
-    fn onMix(ctx: *anyopaque, late: u64) void {
+    pub fn onMix(ctx: *anyopaque, late: u64) void {
         _ = late;
         const self: *Apu = @ptrCast(@alignCast(ctx));
         self.mixOne();
