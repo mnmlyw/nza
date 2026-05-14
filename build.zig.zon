@@ -1,0 +1,15 @@
+.{
+    .name = .nza,
+    .version = "0.0.1",
+    .fingerprint = 0x526dff8a188804a7,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "NOTICE",
+        "README.md",
+    },
+}

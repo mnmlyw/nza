@@ -1,0 +1,21 @@
+# Zig build artifacts
+zig-out/
+.zig-cache/
+zig-cache/
+
+# Save files
+*.sav
+
+# OS junk
+.DS_Store
+
+# ROMs — never commit copyrighted material
+*.gba
+*.bin
+
+# Headless debug dumps (mostly written to /tmp/ at runtime; cover any local copies)
+*.ppm
+*.audio
+*.wav
+nza_iram
+nza_ewram

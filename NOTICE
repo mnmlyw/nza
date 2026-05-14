@@ -1,0 +1,23 @@
+nza — a Game Boy Advance emulator in Zig
+Copyright (C) 2026  the nza contributors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is a port of NanoBoyAdvance to Zig.
+
+  NanoBoyAdvance
+  https://github.com/nba-emu/NanoBoyAdvance
+  Copyright (C) fleroviux and contributors
+  Licensed under GPL-3.0-or-later
+
+The structural design (event-driven scheduler, comptime-generated CPU
+dispatch tables, scanline-driven PPU) and many register-level behaviors
+are derived from NanoBoyAdvance. Per the terms of GPL-3.0, the full
+license text is included in the LICENSE file at the root of this
+repository.
+
+Hardware specifications referenced from GBATEK by Martin Korth
+(https://problemkaputt.de/gbatek.htm).
