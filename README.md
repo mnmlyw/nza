@@ -23,8 +23,13 @@ house with correct rendering and audio.
 | M3.4 | MUL/MLA I-cycles + vertical mosaic + per-scanline OAM budget + PPU bus contention | done |
 | M3.5 | jsmolka bugfix sweep — 3 known instruction-level failures, deferred (see below) | partial |
 | M4.0 | GameShark / Action Replay / CodeBreaker cheat-code engine | done |
+| M4.1 | Cart-ROM prefetch buffer (WAITCNT.14) | done |
+| M4.2 | gdbserver stub (GDB Remote Serial Protocol over TCP) | done |
+| M4.3 | SIO single-player stub (graceful no-peer fallback) | done |
+| M4.4 | Link cable multiplayer over TCP between two nza instances | done |
+| M4.5 | Wireless adapter coverage (FR/LG fall-back via SIO stub) | done |
 
-~7250 LOC. 51/51 unit tests + 4/4 integration tests passing.
+~8000 LOC. 53/53 unit tests + 4/4 integration tests passing.
 
 ## What works
 
@@ -71,9 +76,11 @@ house with correct rendering and audio.
   - `memory.gba` test 050 — unaligned LDR/LDM rotation edge
 - **Some Pokémon audio specifics.** M4A song-transition stall still open
   (task #12). PSG channel 3 wave pattern bank-switch edge case.
-- **Multiplayer link cable / SIO**, **wireless adapter**, **JIT
-  recompiler** — multi-week individual undertakings; deferred to M5+.
-- **gdbserver stub** for live debugging — planned (M4.2).
+- **JIT recompiler.** Pure performance optimization. The interpreter
+  runs Pokémon Emerald at >2× real-time on an M1 Mac, so this is
+  cosmetic for now. Tracked for M5.
+- **Three jsmolka instruction-level failures** (see top of "What
+  doesn't"). Don't block any commercial game.
 - **GamePak DRQ / Video Capture special-DMA** — niche corner cases.
 
 ## Build
@@ -102,6 +109,10 @@ nza --no-bios rom.gba                # skip BIOS; jump to ROM entry directly
 nza --ppu-test                       # standalone PPU pattern (no ROM, no CPU)
 nza --headless --steps N rom.gba     # run N frames, dump /tmp/nza.ppm
 nza --trace N rom.gba                # single-step the CPU N times, print state
+nza --snapshot-test rom.gba          # save state, run, restore, verify
+nza --gdbserver 1234 rom.gba         # listen for GDB attach on TCP port
+nza --link-host 6789 rom.gba         # host a TCP link-cable session
+nza --link-connect host:port rom.gba # connect to a hosted link-cable session
 ```
 
 The BIOS is not redistributed — supply your own (`gba_bios.bin`). Default
