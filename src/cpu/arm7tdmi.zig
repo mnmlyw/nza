@@ -80,7 +80,10 @@ pub const Cpu = struct {
 
     /// 2-instruction prefetch buffer. `pipeline[0]` = next to execute,
     /// `pipeline[1]` = freshly fetched.
-    pipeline: [2]u32 = .{ 0, 0 },
+    /// 2-instruction prefetch buffer. NBA initializes to 0xF0000000
+    /// (condition=NV — never executes) so any "uninitialized fetch"
+    /// after reset behaves as a NOP. Match.
+    pipeline: [2]u32 = .{ 0xF000_0000, 0xF000_0000 },
 
     bus: *Bus,
 
@@ -104,6 +107,12 @@ pub const Cpu = struct {
     /// take effect until the NEXT instruction. The runFrame loop checks
     /// this latched value, not the live cpsr.irq_disable.
     latch_irq_disable: bool = true,
+
+    /// NBA's `pipe.access`: the access type for the NEXT pipeline fetch.
+    /// Defaults to Nonsequential at reset. Each handler explicitly sets
+    /// it before completing (most set Nonseq; data-proc-imm/shift-imm
+    /// set Seq because the prefetch unit can continue sequentially).
+    pipe_access: Bus.Access = .nonseq,
 
     pub fn init(bus: *Bus) Cpu {
         var cpu = Cpu{ .bus = bus };
@@ -140,6 +149,8 @@ pub const Cpu = struct {
             self.pipeline[1] = self.bus.readTimed(u32, self.r[15], .seq);
             self.r[15] +%= 4;
         }
+        // Next instruction's pipeline[1] is a sequential code-fetch.
+        self.pipe_access = .seq;
         self.branched = true;
     }
 
@@ -158,11 +169,16 @@ pub const Cpu = struct {
         // MSR cpsr_c that disables IRQ doesn't take effect until next
         // instruction).
         self.latch_irq_disable = self.cpsr.irq_disable;
+        // Snapshot the access type set by the PREVIOUS instruction, then
+        // reset to .nonseq as the default for next-instr fetch. NBA's
+        // memory and multiply handlers leave pipe.access = Nonseq;
+        // data-proc-imm/shift-imm explicitly set it to Seq.
+        const pipe_access = self.pipe_access;
+        self.pipe_access = .nonseq;
         if (self.cpsr.thumb) {
             const instr: u16 = @truncate(self.pipeline[0]);
             self.pipeline[0] = self.pipeline[1];
-            // Sequential code-fetch in Thumb (16-bit).
-            self.pipeline[1] = self.bus.readTimed(u16, self.r[15], .seq);
+            self.pipeline[1] = self.bus.readTimed(u16, self.r[15], pipe_access);
             self.bus.last_code_fetch = @as(u32, self.pipeline[1]) | (@as(u32, self.pipeline[1]) << 16);
             const idx: u10 = @intCast((instr >> 6) & 0x3FF);
             decode.thumb_lut[idx](self, instr);
@@ -170,11 +186,13 @@ pub const Cpu = struct {
         } else {
             const instr = self.pipeline[0];
             self.pipeline[0] = self.pipeline[1];
-            self.pipeline[1] = self.bus.readTimed(u32, self.r[15], .seq);
+            self.pipeline[1] = self.bus.readTimed(u32, self.r[15], pipe_access);
             self.bus.last_code_fetch = self.pipeline[1];
 
             const cond: u4 = @intCast(instr >> 28);
             if (!checkCondition(self.cpsr, cond)) {
+                // Condition failed: NBA sets pipe.access = Seq and bumps PC.
+                self.pipe_access = .seq;
                 self.cycles = self.bus.wait_cycles_accum;
                 self.r[15] +%= 4;
                 return;

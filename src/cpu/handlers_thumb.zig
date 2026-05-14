@@ -70,6 +70,7 @@ inline fn setSbcFlags(cpu: *Cpu, a: u32, b: u32, borrow: u32, result: u32) void 
 pub fn moveShiftedRegHandler(comptime op: u2) decode.ThumbFn {
     return struct {
         fn handler(cpu: *Cpu, instr: u16) void {
+            cpu.pipe_access = .seq; // NBA: shift-by-imm leaves pipe.access = Seq
             const offset: u32 = (instr >> 6) & 0x1F;
             const rs: u3 = @intCast((instr >> 3) & 7);
             const rd: u3 = @intCast(instr & 7);
@@ -120,6 +121,7 @@ pub fn moveShiftedRegHandler(comptime op: u2) decode.ThumbFn {
 pub fn addSubHandler(comptime is_sub: bool, comptime is_imm: bool) decode.ThumbFn {
     return struct {
         fn handler(cpu: *Cpu, instr: u16) void {
+            cpu.pipe_access = .seq;
             const operand_field: u32 = (instr >> 6) & 7;
             const rs: u3 = @intCast((instr >> 3) & 7);
             const rd: u3 = @intCast(instr & 7);
@@ -139,6 +141,7 @@ pub fn addSubHandler(comptime is_sub: bool, comptime is_imm: bool) decode.ThumbF
 pub fn movCmpAddSubImmHandler(comptime op: u2) decode.ThumbFn {
     return struct {
         fn handler(cpu: *Cpu, instr: u16) void {
+            cpu.pipe_access = .seq;
             const rd: u3 = @intCast((instr >> 8) & 7);
             const imm: u32 = instr & 0xFF;
             const a = cpu.r[rd];
@@ -171,6 +174,7 @@ pub fn movCmpAddSubImmHandler(comptime op: u2) decode.ThumbFn {
 // =====================================================================
 
 pub fn aluHandler(cpu: *Cpu, instr: u16) void {
+    cpu.pipe_access = .seq; // NBA: default Seq, shifts/MUL override to NSeq
     const op: u4 = @intCast((instr >> 6) & 0xF);
     const rs: u3 = @intCast((instr >> 3) & 7);
     const rd: u3 = @intCast(instr & 7);
@@ -189,6 +193,7 @@ pub fn aluHandler(cpu: *Cpu, instr: u16) void {
         },
         0x2 => { // LSL Rd, Rs — NBA adds bus.Idle() for register-shift
             cpu.bus.wait_cycles_accum +%= 1;
+            cpu.pipe_access = .nonseq;
             const amt = b & 0xFF;
             if (amt == 0) {
                 setNZ(cpu, a);
@@ -209,6 +214,7 @@ pub fn aluHandler(cpu: *Cpu, instr: u16) void {
         },
         0x3 => { // LSR Rd, Rs
             cpu.bus.wait_cycles_accum +%= 1;
+            cpu.pipe_access = .nonseq;
             const amt = b & 0xFF;
             if (amt == 0) {
                 setNZ(cpu, a);
@@ -229,6 +235,7 @@ pub fn aluHandler(cpu: *Cpu, instr: u16) void {
         },
         0x4 => { // ASR Rd, Rs
             cpu.bus.wait_cycles_accum +%= 1;
+            cpu.pipe_access = .nonseq;
             const amt = b & 0xFF;
             if (amt == 0) {
                 setNZ(cpu, a);
@@ -258,6 +265,7 @@ pub fn aluHandler(cpu: *Cpu, instr: u16) void {
         },
         0x7 => { // ROR Rd, Rs
             cpu.bus.wait_cycles_accum +%= 1;
+            cpu.pipe_access = .nonseq;
             const amt = b & 0xFF;
             if (amt == 0) {
                 setNZ(cpu, a);
@@ -296,6 +304,7 @@ pub fn aluHandler(cpu: *Cpu, instr: u16) void {
         0xD => { // MUL — NBA bills TickMultiply (1+N I-cycles)
             const arm = @import("handlers_arm.zig");
             _ = arm.tickMultiplyPub(cpu, b);
+            cpu.pipe_access = .nonseq;
             const r = a *% b;
             cpu.r[rd] = r;
             setNZ(cpu, r);
@@ -319,6 +328,7 @@ pub fn aluHandler(cpu: *Cpu, instr: u16) void {
 // =====================================================================
 
 pub fn hiRegHandler(cpu: *Cpu, instr: u16) void {
+    cpu.pipe_access = .seq; // NBA: hi-reg ADD/CMP/MOV leaves Seq; BX uses reloadPipeline
     const op: u2 = @intCast((instr >> 8) & 3);
     const h1: u1 = @intCast((instr >> 7) & 1);
     const h2: u1 = @intCast((instr >> 6) & 1);
@@ -542,6 +552,7 @@ pub fn spRelHandler(comptime is_load: bool) decode.ThumbFn {
 pub fn loadAddressHandler(comptime is_sp: bool) decode.ThumbFn {
     return struct {
         fn handler(cpu: *Cpu, instr: u16) void {
+            cpu.pipe_access = .seq;
             const rd: u3 = @intCast((instr >> 8) & 7);
             const offset: u32 = (@as(u32, instr) & 0xFF) << 2;
             const base: u32 = if (is_sp) cpu.r[13] else cpu.r[15] & ~@as(u32, 3);
@@ -555,6 +566,7 @@ pub fn loadAddressHandler(comptime is_sp: bool) decode.ThumbFn {
 // =====================================================================
 
 pub fn addToSp(cpu: *Cpu, instr: u16) void {
+    cpu.pipe_access = .seq;
     const offset: u32 = (@as(u32, instr) & 0x7F) << 2;
     if ((instr & 0x80) != 0) {
         cpu.r[13] -%= offset;
@@ -657,7 +669,11 @@ pub fn multipleLoadStoreHandler(comptime is_load: bool) decode.ThumbFn {
 pub fn conditionalBranchHandler(comptime cond: u4) decode.ThumbFn {
     return struct {
         fn handler(cpu: *Cpu, instr: u16) void {
-            if (!cpu_mod.checkCondition(cpu.cpsr, cond)) return;
+            if (!cpu_mod.checkCondition(cpu.cpsr, cond)) {
+                // Branch not taken: NBA sets Seq for next code-fetch.
+                cpu.pipe_access = .seq;
+                return;
+            }
             // target = PC + offset, where r[15] at execute = instr_addr + 4.
             const offset_8: i8 = @bitCast(@as(u8, @truncate(instr)));
             const offset = @as(i32, offset_8) << 1;
@@ -706,6 +722,7 @@ pub fn longBranchHandler(comptime is_high: bool) decode.ThumbFn {
             const offset11: u32 = instr & 0x7FF;
             if (!is_high) {
                 // First half: LR = PC + (sign_ext(offset11) << 12).
+                cpu.pipe_access = .seq; // NBA sets Seq for first half
                 const signed: i32 = @as(i32, @bitCast(offset11 << 21)) >> 9;
                 cpu.r[14] = @as(u32, @bitCast(@as(i32, @bitCast(cpu.r[15])) +% signed));
             } else {

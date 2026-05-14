@@ -203,6 +203,8 @@ pub fn dataProcHandler(comptime top: u8, comptime low: u4) decode.ArmFn {
             var carry: bool = cpu.cpsr.carry;
 
             if (I) {
+                // Immediate operand2: NBA leaves pipe.access = Seq.
+                cpu.pipe_access = .seq;
                 const value: u32 = instr & 0xFF;
                 const shift: u32 = ((instr >> 8) & 0xF) * 2;
                 if (shift != 0) {
@@ -216,6 +218,8 @@ pub fn dataProcHandler(comptime top: u8, comptime low: u4) decode.ArmFn {
                 const shift_imm = ((instr >> 4) & 1) == 0;
                 var shift: u32 = undefined;
                 if (shift_imm) {
+                    // Shift-by-imm: pipe.access = Seq (same as immediate path).
+                    cpu.pipe_access = .seq;
                     shift = (instr >> 7) & 0x1F;
                 } else {
                     shift = cpu.r[@as(u4, @intCast((instr >> 8) & 0xF))];
@@ -223,6 +227,7 @@ pub fn dataProcHandler(comptime top: u8, comptime low: u4) decode.ArmFn {
                     cpu.r[15] +%= 4;
                     cpu.bus.wait_cycles_accum +%= 1; // I-cycle
                     cpu.branched = true; // suppress step()'s post-handler +4
+                    // pipe_access stays as the step() default (Nonseq).
                 }
                 op1 = cpu.r[rn];
                 op2 = cpu.r[@as(u4, @intCast(instr & 0xF))];
@@ -420,6 +425,8 @@ pub fn singleDataTransferHandler(comptime top: u8, comptime low: u4) decode.ArmF
                 break :blk r[0];
             } else instr & 0xFFF;
 
+            cpu.pipe_access = .nonseq; // NBA: pipe.access = NSeq
+
             const base = cpu.r[rn];
             const offset_addr = if (U) base +% offset else base -% offset;
             const addr = if (P) offset_addr else base;
@@ -472,6 +479,7 @@ pub fn mulHandler(comptime opcode: u4) decode.ArmFn {
             // NBA: state.r15 += 4; pipe.access = NSeq; bus.Idle()×N
             cpu.r[15] +%= 4;
             cpu.branched = true;
+            cpu.pipe_access = .nonseq;
             const lhs = cpu.r[op1];
             const rhs = cpu.r[op2];
             var result: u32 = lhs *% rhs;
@@ -540,6 +548,8 @@ pub fn blockTransferHandler(comptime top: u8) decode.ArmFn {
             var cur: u32 = start_addr;
             if (P == U) cur +%= 4;
 
+            cpu.pipe_access = .nonseq; // NBA: pipe.access = NSeq
+
             // NBA's user-mode LDM/STM (the `^` form): when S is set and
             // PC is NOT in the list (or it's a STM), temporarily switch
             // to user-mode banked regs for the transfer.
@@ -603,6 +613,7 @@ pub fn mulLongHandler(comptime uas: u3) decode.ArmFn {
             // NBA: state.r15 += 4; pipe.access = NSeq
             cpu.r[15] +%= 4;
             cpu.branched = true;
+            cpu.pipe_access = .nonseq;
 
             const lhs = cpu.r[rm];
             const rhs = cpu.r[rs];
@@ -651,6 +662,7 @@ pub fn swpHandler(comptime byte: bool) decode.ArmFn {
             // NBA: state.r15 += 4 prologue.
             cpu.r[15] +%= 4;
             cpu.branched = true;
+            cpu.pipe_access = .nonseq;
             const addr = cpu.r[base];
             const tmp: u32 = if (byte)
                 @as(u32, cpu.bus.read(u8, addr))
@@ -692,6 +704,8 @@ pub fn halfwordTransferHandler(comptime top: u8, comptime sh: u2) decode.ArmFn {
                 const lo: u32 = instr & 0xF;
                 break :blk (hi << 4) | lo;
             } else cpu.r[@as(u4, @intCast(instr & 0xF))];
+
+            cpu.pipe_access = .nonseq; // NBA: pipe.access = NSeq
 
             const base = cpu.r[rn];
             const offset_addr = if (U) base +% offset else base -% offset;
@@ -759,6 +773,7 @@ pub fn psrTransferHandler(
 ) decode.ArmFn {
     return struct {
         fn handler(cpu: *Cpu, instr: u32) void {
+            cpu.pipe_access = .seq; // NBA: MSR/MRS sets pipe.access = Seq
             if (!is_msr) {
                 // MRS Rd, PSR
                 const rd: u4 = @intCast((instr >> 12) & 0xF);
