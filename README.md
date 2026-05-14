@@ -73,15 +73,16 @@ NBA uses, just with fewer specialized translations so far.
 
 ## What doesn't (yet)
 
-- **Cart-ROM prefetch buffer.** WAITCNT.14 (prefetch enable) is honored
-  but the speculative-fetch FIFO state machine isn't modelled, so games
-  that depend on it for tight timing run slightly slower than real
-  hardware. (Performance accuracy, not correctness.)
-- **Three jsmolka instruction-level test failures.**
-  - `arm.gba` test 225 — undetermined; suspected MUL/long-MUL flag edge
-  - `thumb.gba` — CPU enters a code path that bounces ARM↔Thumb early
-    and never resyncs (likely a PUSH/POP corner case the test exercises)
-  - `memory.gba` test 050 — unaligned LDR/LDM rotation edge
+- **One jsmolka test failure remaining.** `arm.gba` test 225 needs
+  PC+12 (not PC+8) when read as Rn under register-specified shift. The
+  fix is correct per ARM7TDMI spec but causes a regression elsewhere
+  in arm.gba that we haven't isolated. memory.gba and thumb.gba both
+  pass now (M3.5 closure fixes: Thumb POP-pc mode preservation +
+  OAM/PRAM/VRAM byte-write rules).
+- **M4A song-transition stall** (Pokémon Emerald). M4A engine stops
+  updating its IRAM mixer buffer after ~5s; same audio loops. Likely a
+  timing-sensitive flag the CPU isn't setting right — needs pret/
+  pokeemerald cross-reference.
 - **Some Pokémon audio specifics.** M4A song-transition stall still open
   (task #12). PSG channel 3 wave pattern bank-switch edge case.
 - **JIT speedup.** The JIT compiles and runs every ARM+Thumb
