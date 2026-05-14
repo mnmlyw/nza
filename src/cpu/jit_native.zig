@@ -159,6 +159,32 @@ pub const Emitter = struct {
         const imm12: u32 = @intCast(byte_off >> 3);
         self.write(0xF94003E0 | (imm12 << 10) | @as(u32, xt));
     }
+
+    /// LDR Wt, [Xn, #imm12*4].
+    pub fn ldrWImmU(self: *Emitter, wt: u5, xn: u5, byte_off: u14) void {
+        const imm12: u32 = @intCast(byte_off >> 2);
+        self.write(0xB9400000 | (imm12 << 10) | (@as(u32, xn) << 5) | @as(u32, wt));
+    }
+
+    /// ADD Wd, Wn, #imm12 — 32-bit add with unshifted immediate.
+    pub fn addWImm(self: *Emitter, wd: u5, wn: u5, imm12: u12) void {
+        self.write(0x11000000 | (@as(u32, imm12) << 10) | (@as(u32, wn) << 5) | @as(u32, wd));
+    }
+
+    /// SUB Wd, Wn, #imm12.
+    pub fn subWImm(self: *Emitter, wd: u5, wn: u5, imm12: u12) void {
+        self.write(0x51000000 | (@as(u32, imm12) << 10) | (@as(u32, wn) << 5) | @as(u32, wd));
+    }
+
+    /// ORR Wd, Wn, Wm — register-form bitwise OR.
+    pub fn orrWReg(self: *Emitter, wd: u5, wn: u5, wm: u5) void {
+        self.write(0x2A000000 | (@as(u32, wm) << 16) | (@as(u32, wn) << 5) | @as(u32, wd));
+    }
+
+    /// AND Wd, Wn, Wm — register-form bitwise AND.
+    pub fn andWReg(self: *Emitter, wd: u5, wn: u5, wm: u5) void {
+        self.write(0x0A000000 | (@as(u32, wm) << 16) | (@as(u32, wn) << 5) | @as(u32, wd));
+    }
 };
 
 /// Translate a single ARM instruction. Returns true if translation
@@ -180,6 +206,9 @@ pub fn translateArm(em: *Emitter, instr: u32) bool {
         const r_base: u14 = comptime @intCast(@offsetOf(Cpu, "r"));
         const off: u14 = r_base + @as(u14, rd) * 4;
 
+        const rn: u4 = @intCast((instr >> 16) & 0xF);
+        const rn_off: u14 = r_base + @as(u14, rn) * 4;
+
         switch (opcode) {
             0b1101 => { // MOV Rd, #imm
                 em.movzW(1, @intCast(imm_field));
@@ -189,6 +218,36 @@ pub fn translateArm(em: *Emitter, instr: u32) bool {
             0b1111 => { // MVN Rd, #imm  (Rd = ~imm)
                 em.movzW(1, @intCast(imm_field ^ 0xFFFF)); // low 16 bits inverted
                 em.movkW(1, 0xFFFF, 16); // upper 16 bits all-ones
+                em.strWImmU(1, 0, off);
+                return true;
+            },
+            0b0100 => { // ADD Rd, Rn, #imm  (only if Rn != PC and imm fits in 12 bits)
+                if (rn == 15 or imm_field > 0xFFF) return false;
+                em.ldrWImmU(1, 0, rn_off); // W1 = cpu.r[rn]
+                em.addWImm(1, 1, @intCast(imm_field)); // W1 += imm
+                em.strWImmU(1, 0, off);
+                return true;
+            },
+            0b0010 => { // SUB Rd, Rn, #imm
+                if (rn == 15 or imm_field > 0xFFF) return false;
+                em.ldrWImmU(1, 0, rn_off);
+                em.subWImm(1, 1, @intCast(imm_field));
+                em.strWImmU(1, 0, off);
+                return true;
+            },
+            0b1100 => { // ORR Rd, Rn, #imm  (only when imm fits in 16 bits)
+                if (rn == 15) return false;
+                em.ldrWImmU(1, 0, rn_off);
+                em.movzW(2, @intCast(imm_field));
+                em.orrWReg(1, 1, 2);
+                em.strWImmU(1, 0, off);
+                return true;
+            },
+            0b0000 => { // AND Rd, Rn, #imm
+                if (rn == 15) return false;
+                em.ldrWImmU(1, 0, rn_off);
+                em.movzW(2, @intCast(imm_field));
+                em.andWReg(1, 1, 2);
                 em.strWImmU(1, 0, off);
                 return true;
             },
@@ -378,6 +437,58 @@ test "JIT compiles Thumb block via interpreter callouts" {
     fn_ptr(&cpu);
     try std.testing.expectEqual(@as(u32, 100), cpu.r[2]);
     try std.testing.expectEqual(@as(u32, 200), cpu.r[3]);
+}
+
+test "JIT compiles ARM ADD r0, r1, #5" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return;
+    var page = CodePage.alloc() orelse return;
+    defer page.free();
+    // ADD r0, r1, #5  →  E2810005
+    const fn_ptr = compileSingle(&page, 0xE281_0005) orelse return error.JitNotSupported;
+    var bus: @import("../core/bus.zig").Bus = .{};
+    var cpu = Cpu.init(&bus);
+    cpu.r[1] = 100;
+    fn_ptr(&cpu);
+    try std.testing.expectEqual(@as(u32, 105), cpu.r[0]);
+}
+
+test "JIT compiles ARM ORR r0, r1, #0xFF" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return;
+    var page = CodePage.alloc() orelse return;
+    defer page.free();
+    // ORR r0, r1, #0xFF  →  E38100FF
+    const fn_ptr = compileSingle(&page, 0xE381_00FF) orelse return error.JitNotSupported;
+    var bus: @import("../core/bus.zig").Bus = .{};
+    var cpu = Cpu.init(&bus);
+    cpu.r[1] = 0xAA00;
+    fn_ptr(&cpu);
+    try std.testing.expectEqual(@as(u32, 0xAAFF), cpu.r[0]);
+}
+
+test "JIT compiles ARM AND r0, r1, #0x0F" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return;
+    var page = CodePage.alloc() orelse return;
+    defer page.free();
+    // AND r0, r1, #0x0F  →  E201000F
+    const fn_ptr = compileSingle(&page, 0xE201_000F) orelse return error.JitNotSupported;
+    var bus: @import("../core/bus.zig").Bus = .{};
+    var cpu = Cpu.init(&bus);
+    cpu.r[1] = 0xDEAD_BEEF;
+    fn_ptr(&cpu);
+    try std.testing.expectEqual(@as(u32, 0x0F), cpu.r[0]);
+}
+
+test "JIT compiles ARM SUB r2, r3, #10" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return;
+    var page = CodePage.alloc() orelse return;
+    defer page.free();
+    // SUB r2, r3, #10  →  E243200A
+    const fn_ptr = compileSingle(&page, 0xE243_200A) orelse return error.JitNotSupported;
+    var bus: @import("../core/bus.zig").Bus = .{};
+    var cpu = Cpu.init(&bus);
+    cpu.r[3] = 50;
+    fn_ptr(&cpu);
+    try std.testing.expectEqual(@as(u32, 40), cpu.r[2]);
 }
 
 test "JIT compiles ARM MVN r3, #0 and executes" {
