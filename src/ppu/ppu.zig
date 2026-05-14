@@ -64,6 +64,12 @@ pub const Ppu = struct {
     obj_line: [SCREEN_WIDTH]LayerPixel = [_]LayerPixel{.{}} ** SCREEN_WIDTH,
     obj_win: [SCREEN_WIDTH]bool = [_]bool{false} ** SCREEN_WIDTH,
 
+    /// Affine BG internal X/Y reference. Reloaded from BGxX/BGxY MMIO at
+    /// VBlank start; incremented by PB/PD after every rendered scanline.
+    /// Index 0 = BG2, Index 1 = BG3.
+    affine_x: [2]i32 = [_]i32{ 0, 0 },
+    affine_y: [2]i32 = [_]i32{ 0, 0 },
+
     pub fn init(self: *Ppu) void {
         self.io.vcount = 0;
         self.io.dispstat &= 0xFF07;
@@ -77,12 +83,20 @@ pub const Ppu = struct {
         // Render the line we just finished drawing.
         if (self.io.vcount < @as(u16, @intCast(SCREEN_HEIGHT))) {
             renderScanline(self, self.io.vcount);
+            // Advance affine BG internal ref by PB/PD for the next scanline.
+            const pb_bg2 = @as(i32, @as(i16, @bitCast(self.io.read(u16, 0x22))));
+            const pd_bg2 = @as(i32, @as(i16, @bitCast(self.io.read(u16, 0x26))));
+            const pb_bg3 = @as(i32, @as(i16, @bitCast(self.io.read(u16, 0x32))));
+            const pd_bg3 = @as(i32, @as(i16, @bitCast(self.io.read(u16, 0x36))));
+            self.affine_x[0] +%= pb_bg2;
+            self.affine_y[0] +%= pd_bg2;
+            self.affine_x[1] +%= pb_bg3;
+            self.affine_y[1] +%= pd_bg3;
         }
 
         // Enter H-blank.
         self.io.dispstat |= 0x0002;
         if ((self.io.dispstat & 0x0010) != 0) self.irq.raise(.hblank);
-        // HBlank DMA fires only during visible scanlines (not during VBlank).
         if (self.io.vcount < @as(u16, @intCast(SCREEN_HEIGHT))) {
             self.dma.onEvent(.hblank);
         }
@@ -100,13 +114,19 @@ pub const Ppu = struct {
         if (self.io.vcount == VBLANK_FIRST_LINE) {
             self.io.dispstat |= 0x0001;
             // We raise the VBlank flag in IF unconditionally rather than
-            // gating on DISPSTAT.VBI_enable. NBA/mGBA do the same: the
-            // hardware fires the IRQ pin only when DISPSTAT.3 is set, but
-            // the IF flag itself is set on every VBlank entry. Pokemon
-            // Emerald assumes this behaviour.
+            // gating on DISPSTAT.VBI_enable. NBA/mGBA do the same.
             self.irq.raise(.vblank);
             self.dma.onEvent(.vblank);
         } else if (self.io.vcount == 0) {
+            // Top of frame: reload internal affine refs from MMIO. Real
+            // hardware does this at VBlank start (which is end of line 159
+            // → vcount=160 above), but reloading at vcount=0 — the start
+            // of the visible frame — is functionally equivalent because
+            // the affine BG isn't rendered during VBlank anyway.
+            self.affine_x[0] = signExtend28(self.io.read(u32, 0x28));
+            self.affine_y[0] = signExtend28(self.io.read(u32, 0x2C));
+            self.affine_x[1] = signExtend28(self.io.read(u32, 0x38));
+            self.affine_y[1] = signExtend28(self.io.read(u32, 0x3C));
             self.io.dispstat &= ~@as(u16, 0x0001);
         }
 
@@ -166,54 +186,311 @@ fn renderScanline(self: *Ppu, y: u16) void {
         return;
     }
 
-    const mode: u3 = @intCast(dispcnt & 7);
-    const base_fb = @as(usize, y) * SCREEN_WIDTH;
-    const backdrop = bgr555ToArgb(pramBgColor(self.bus, 0));
-    for (0..SCREEN_WIDTH) |x| self.framebuffer[base_fb + x] = backdrop;
+    // Clear per-layer line buffers (M2.2). Default LayerPixel has
+    // priority=4 + flags=0 (transparent) — sentinels that the
+    // compositor treats as "skip".
+    for (&self.bg_line) |*bg_buf| @memset(bg_buf, .{});
+    @memset(&self.obj_line, .{});
+    @memset(&self.obj_win, false);
 
+    const mode: u3 = @intCast(dispcnt & 7);
     switch (mode) {
-        0 => renderMode0(self, y, dispcnt),
-        1 => renderMode1(self, y, dispcnt),
-        2 => renderMode2(self, y, dispcnt),
-        3 => renderMode3(self, y),
-        4 => renderMode4(self, y, dispcnt),
-        5 => renderMode5(self, y, dispcnt),
+        0 => {
+            // All four text BGs.
+            for (0..4) |i| {
+                const bg: u2 = @intCast(i);
+                const enable_bit: u4 = 8 + @as(u4, bg);
+                if ((dispcnt & (@as(u16, 1) << enable_bit)) != 0) {
+                    renderTextBg(self, y, bg);
+                }
+            }
+        },
+        1 => {
+            if ((dispcnt & (1 << 8)) != 0) renderTextBg(self, y, 0);
+            if ((dispcnt & (1 << 9)) != 0) renderTextBg(self, y, 1);
+            if ((dispcnt & (1 << 10)) != 0) renderAffineBg(self, y, 2);
+        },
+        2 => {
+            if ((dispcnt & (1 << 10)) != 0) renderAffineBg(self, y, 2);
+            if ((dispcnt & (1 << 11)) != 0) renderAffineBg(self, y, 3);
+        },
+        3 => renderBitmapBg(self, y, 3, dispcnt),
+        4 => renderBitmapBg(self, y, 4, dispcnt),
+        5 => renderBitmapBg(self, y, 5, dispcnt),
         else => {},
     }
 
-    // Sprite layer overlays the chosen BG mode.
     if ((dispcnt & 0x1000) != 0) renderSprites(self, y, dispcnt);
+
+    applyMosaic(self);
+
+    compositeScanline(self, y, dispcnt);
+}
+
+/// Apply MOSAIC horizontal stair-stepping to any BG that has BGCNT.6 set
+/// and to OBJ pixels flagged with mosaic (attr0 bit 12 — TODO: we don't
+/// track that per-OBJ yet; we apply OBJ mosaic universally if the OBJ-H
+/// nibble is non-zero, which matches most games). Vertical mosaic is
+/// deferred (would require per-row caching).
+fn applyMosaic(self: *Ppu) void {
+    const mosaic = self.io.read(u16, 0x04C);
+    const bg_h: u8 = @intCast(mosaic & 0xF);
+    const obj_h: u8 = @intCast((mosaic >> 8) & 0xF);
+
+    if (bg_h != 0) {
+        const step: usize = @as(usize, bg_h) + 1;
+        var bi: usize = 0;
+        while (bi < 4) : (bi += 1) {
+            const bgcnt = self.io.read(u16, 0x008 + @as(u32, @intCast(bi)) * 2);
+            if ((bgcnt & 0x40) == 0) continue;
+            const buf = &self.bg_line[bi];
+            var x: usize = 0;
+            while (x < SCREEN_WIDTH) : (x += step) {
+                const group_color = buf[x];
+                var k: usize = 1;
+                while (k < step and x + k < SCREEN_WIDTH) : (k += 1) {
+                    buf[x + k] = group_color;
+                }
+            }
+        }
+    }
+
+    if (obj_h != 0) {
+        const step: usize = @as(usize, obj_h) + 1;
+        var x: usize = 0;
+        while (x < SCREEN_WIDTH) : (x += step) {
+            const group_color = self.obj_line[x];
+            var k: usize = 1;
+            while (k < step and x + k < SCREEN_WIDTH) : (k += 1) {
+                self.obj_line[x + k] = group_color;
+            }
+        }
+    }
 }
 
 // =====================================================================
-// Mode 1: BG0 + BG1 text, BG2 affine
+// Compositor — per-pixel layer ordering + alpha/brightness/windows
 // =====================================================================
-fn renderMode1(self: *Ppu, y: u16, dispcnt: u16) void {
-    if ((dispcnt & (1 << 8)) != 0) renderTextBgDirect(self, y, 0);
-    if ((dispcnt & (1 << 9)) != 0) renderTextBgDirect(self, y, 1);
-    if ((dispcnt & (1 << 10)) != 0) renderAffineBg(self, y, 2);
+
+const LAYER_OBJ: u8 = 4;
+const LAYER_BD: u8 = 5;
+
+fn compositeScanline(self: *Ppu, y: u16, dispcnt: u16) void {
+    const base_fb = @as(usize, y) * SCREEN_WIDTH;
+    const backdrop_color = pramBgColor(self.bus, 0);
+    const obj_enabled = (dispcnt & 0x1000) != 0;
+    const bg_enabled = [4]bool{
+        (dispcnt & (1 << 8)) != 0,
+        (dispcnt & (1 << 9)) != 0,
+        (dispcnt & (1 << 10)) != 0,
+        (dispcnt & (1 << 11)) != 0,
+    };
+
+    const bldcnt = self.io.read(u16, 0x050);
+    const blend_mode: u2 = @intCast((bldcnt >> 6) & 0x3);
+    const tgt1: u8 = @intCast(bldcnt & 0x3F);
+    const tgt2: u8 = @intCast((bldcnt >> 8) & 0x3F);
+
+    const bldalpha = self.io.read(u16, 0x052);
+    const eva: u8 = @min(@as(u8, @intCast(bldalpha & 0x1F)), 16);
+    const evb: u8 = @min(@as(u8, @intCast((bldalpha >> 8) & 0x1F)), 16);
+    const bldy = self.io.read(u16, 0x054);
+    const evy: u8 = @min(@as(u8, @intCast(bldy & 0x1F)), 16);
+
+    // Windowing — build a per-pixel "layer enable" mask + a per-pixel
+    // "blend enable" flag, both 6-bit (one bit per BG0..BG3 + OBJ + BLD).
+    var win_mask: [SCREEN_WIDTH]u8 = undefined;
+    const any_window = (dispcnt & 0xE000) != 0;
+    if (any_window) {
+        buildWindowMask(self, y, dispcnt, &win_mask);
+    } else {
+        @memset(&win_mask, 0x3F); // everything enabled
+    }
+
+    var x: usize = 0;
+    while (x < SCREEN_WIDTH) : (x += 1) {
+        const win_layers = win_mask[x]; // bits 0..4 = BG0..3,OBJ enable; bit 5 = blend enable
+        // Find the two topmost opaque layers (top + bot). Layer order
+        // rule: lower priority wins; on tie, OBJ beats BG; among BGs at
+        // tie, lower index wins.
+        var top_color: u16 = backdrop_color;
+        var top_priority: u8 = 5; // worse than any BG/OBJ
+        var top_layer: u8 = LAYER_BD;
+        var top_is_obj_blend: bool = false;
+        var bot_color: u16 = backdrop_color;
+        var bot_layer: u8 = LAYER_BD;
+
+        // OBJ candidate.
+        const obj_lp = self.obj_line[x];
+        if (obj_enabled and (obj_lp.flags & FLAG_OPAQUE) != 0 and (win_layers & 0x10) != 0) {
+            top_color = obj_lp.color;
+            top_priority = obj_lp.priority;
+            top_layer = LAYER_OBJ;
+            top_is_obj_blend = (obj_lp.flags & FLAG_OBJ_BLEND) != 0;
+        }
+
+        var bi: u8 = 0;
+        while (bi < 4) : (bi += 1) {
+            if (!bg_enabled[bi]) continue;
+            if ((win_layers & (@as(u8, 1) << @intCast(bi))) == 0) continue;
+            const lp = self.bg_line[bi][x];
+            if ((lp.flags & FLAG_OPAQUE) == 0) continue;
+            const better = lp.priority < top_priority or
+                (lp.priority == top_priority and top_layer != LAYER_OBJ and bi < top_layer);
+            if (better) {
+                bot_color = top_color;
+                bot_layer = top_layer;
+                top_color = lp.color;
+                top_priority = lp.priority;
+                top_layer = bi;
+                top_is_obj_blend = false;
+            } else {
+                const beat_bot = (bot_layer == LAYER_BD) or
+                    lp.priority < bot_priorityOf(self, x, bot_layer, bg_enabled, obj_enabled, top_layer) or
+                    (lp.priority == bot_priorityOf(self, x, bot_layer, bg_enabled, obj_enabled, top_layer) and bi < bot_layer);
+                if (beat_bot) {
+                    bot_color = lp.color;
+                    bot_layer = bi;
+                }
+            }
+        }
+
+        // Window may suppress blending at this pixel (bit 5 of win_layers).
+        const win_blend_ok = (win_layers & 0x20) != 0;
+        const top_is_t1 = layerMask(top_layer) & tgt1 != 0;
+        const bot_is_t2 = layerMask(bot_layer) & tgt2 != 0;
+        const effective_mode: u2 = if (top_is_obj_blend and bot_is_t2 and win_blend_ok) 1 else if (win_blend_ok) blend_mode else 0;
+
+        var final_color: u16 = top_color;
+        switch (effective_mode) {
+            0 => {},
+            1 => if (top_is_t1 and bot_is_t2) {
+                final_color = blendAlpha(top_color, bot_color, eva, evb);
+            },
+            2 => if (top_is_t1) {
+                final_color = blendBrightness(top_color, evy, true);
+            },
+            3 => if (top_is_t1) {
+                final_color = blendBrightness(top_color, evy, false);
+            },
+        }
+
+        self.framebuffer[base_fb + x] = bgr555ToArgb(final_color);
+    }
 }
 
-// =====================================================================
-// Mode 2: BG2 + BG3 affine
-// =====================================================================
-fn renderMode2(self: *Ppu, y: u16, dispcnt: u16) void {
-    if ((dispcnt & (1 << 10)) != 0) renderAffineBg(self, y, 2);
-    if ((dispcnt & (1 << 11)) != 0) renderAffineBg(self, y, 3);
+/// Build a 6-bit per-pixel window mask given the current scanline + DISPCNT.
+/// Bits 0-4 enable BG0..BG3 + OBJ; bit 5 enables blending.
+/// Priority: WIN0 > WIN1 > OBJ_WIN > outside (WINOUT).
+fn buildWindowMask(self: *Ppu, y: u16, dispcnt: u16, mask_out: *[SCREEN_WIDTH]u8) void {
+    const w0_en = (dispcnt & 0x2000) != 0;
+    const w1_en = (dispcnt & 0x4000) != 0;
+    const objwin_en = (dispcnt & 0x8000) != 0;
+
+    const win0h = self.io.read(u16, 0x040);
+    const win1h = self.io.read(u16, 0x042);
+    const win0v = self.io.read(u16, 0x044);
+    const win1v = self.io.read(u16, 0x046);
+    const winin = self.io.read(u16, 0x048);
+    const winout = self.io.read(u16, 0x04A);
+
+    const w0_in: u8 = @intCast(winin & 0x3F);
+    const w1_in: u8 = @intCast((winin >> 8) & 0x3F);
+    const outside: u8 = @intCast(winout & 0x3F);
+    const obj_in: u8 = @intCast((winout >> 8) & 0x3F);
+
+    const w0_x0: u32 = (win0h >> 8) & 0xFF;
+    const w0_x1: u32 = win0h & 0xFF;
+    const w0_y0: u32 = (win0v >> 8) & 0xFF;
+    const w0_y1: u32 = win0v & 0xFF;
+    const w1_x0: u32 = (win1h >> 8) & 0xFF;
+    const w1_x1: u32 = win1h & 0xFF;
+    const w1_y0: u32 = (win1v >> 8) & 0xFF;
+    const w1_y1: u32 = win1v & 0xFF;
+
+    const in_w0_y = w0_en and inWindowRange(y, w0_y0, w0_y1);
+    const in_w1_y = w1_en and inWindowRange(y, w1_y0, w1_y1);
+
+    var x: usize = 0;
+    while (x < SCREEN_WIDTH) : (x += 1) {
+        if (in_w0_y and inWindowRange(@intCast(x), w0_x0, w0_x1)) {
+            mask_out[x] = w0_in;
+        } else if (in_w1_y and inWindowRange(@intCast(x), w1_x0, w1_x1)) {
+            mask_out[x] = w1_in;
+        } else if (objwin_en and self.obj_win[x]) {
+            mask_out[x] = obj_in;
+        } else {
+            mask_out[x] = outside;
+        }
+    }
+}
+
+/// Real hardware "wrap" window semantics: if start > end, the window
+/// covers [start..max] U [0..end]; otherwise plain [start..end). Edge
+/// case: if either coord >= 256 it's treated as ≥ display dimension.
+fn inWindowRange(value: u32, start: u32, end: u32) bool {
+    if (start <= end) return value >= start and value < end;
+    return value >= start or value < end;
+}
+
+fn layerMask(layer: u8) u8 {
+    return @as(u8, 1) << @intCast(layer);
+}
+
+/// Helper used inside compositeScanline to read a layer's priority at x
+/// for second-target ordering decisions.
+fn bot_priorityOf(self: *const Ppu, x: usize, layer: u8, bg_enabled: [4]bool, obj_enabled: bool, top_layer: u8) u8 {
+    _ = top_layer;
+    if (layer == LAYER_BD) return 5;
+    if (layer == LAYER_OBJ) {
+        if (!obj_enabled) return 5;
+        return self.obj_line[x].priority;
+    }
+    if (layer < 4 and bg_enabled[layer]) return self.bg_line[layer][x].priority;
+    return 5;
+}
+
+fn blendAlpha(top: u16, bot: u16, eva: u8, evb: u8) u16 {
+    const r_t: u32 = top & 0x1F;
+    const g_t: u32 = (top >> 5) & 0x1F;
+    const b_t: u32 = (top >> 10) & 0x1F;
+    const r_b: u32 = bot & 0x1F;
+    const g_b: u32 = (bot >> 5) & 0x1F;
+    const b_b: u32 = (bot >> 10) & 0x1F;
+    const r: u32 = @min((r_t * eva + r_b * evb) >> 4, 31);
+    const g: u32 = @min((g_t * eva + g_b * evb) >> 4, 31);
+    const b: u32 = @min((b_t * eva + b_b * evb) >> 4, 31);
+    return @intCast(r | (g << 5) | (b << 10));
+}
+
+fn blendBrightness(top: u16, evy: u8, brighten: bool) u16 {
+    var r: u32 = top & 0x1F;
+    var g: u32 = (top >> 5) & 0x1F;
+    var b: u32 = (top >> 10) & 0x1F;
+    if (brighten) {
+        r = r + (((31 - r) * evy) >> 4);
+        g = g + (((31 - g) * evy) >> 4);
+        b = b + (((31 - b) * evy) >> 4);
+    } else {
+        r = r - ((r * evy) >> 4);
+        g = g - ((g * evy) >> 4);
+        b = b - ((b * evy) >> 4);
+    }
+    return @intCast(r | (g << 5) | (b << 10));
+}
+
+/// Sign-extend a 28-bit value (stored in the low bits of u32) to i32.
+inline fn signExtend28(v: u32) i32 {
+    return @as(i32, @bitCast(v << 4)) >> 4;
 }
 
 /// Render an affine (rotation/scaling) BG scanline applying the matrix
-/// (PA/PB/PC/PD) and the X/Y reference points. 28-bit signed fixed-point
-/// (8 fractional bits). Display-area overflow bit (BGCNT bit 13) selects
-/// wraparound vs transparent-outside-map.
-///
-/// M1.5 simplification: we use the user-written BGxX/BGxY as the origin
-/// for the whole scanline rather than maintaining a per-scanline internal
-/// reference that PPU increments by PB/PD. That's correct for static or
-/// per-frame-set BGs (e.g. the Pokemon Emerald boot splash).
+/// (PA/PB/PC/PD) and the X/Y reference points. Writes opaque pixels into
+/// `self.bg_line[bg]`.
 fn renderAffineBg(self: *Ppu, y: u16, bg: u2) void {
     const cnt_offset: u32 = 0x008 + @as(u32, bg) * 2;
     const bgcnt = self.io.read(u16, cnt_offset);
+    const priority: u8 = @intCast(bgcnt & 0x3);
     const char_block: u32 = (@as(u32, bgcnt) >> 2) & 0x3;
     const screen_block: u32 = (@as(u32, bgcnt) >> 8) & 0x1F;
     const overflow_wrap = (bgcnt & 0x2000) != 0;
@@ -223,22 +500,20 @@ fn renderAffineBg(self: *Ppu, y: u16, bg: u2) void {
     const char_base = char_block * 0x4000;
     const screen_base = screen_block * 0x800;
 
-    // BG2 / BG3 affine registers live at 0x20+ / 0x30+ respectively.
     const ref_base: u32 = if (bg == 2) 0x20 else 0x30;
     const pa = @as(i32, @as(i16, @bitCast(self.io.read(u16, ref_base + 0))));
-    const pb = @as(i32, @as(i16, @bitCast(self.io.read(u16, ref_base + 2))));
     const pc = @as(i32, @as(i16, @bitCast(self.io.read(u16, ref_base + 4))));
-    const pd = @as(i32, @as(i16, @bitCast(self.io.read(u16, ref_base + 6))));
-    const x_ref = signExtend28(self.io.read(u32, ref_base + 8));
-    const y_ref = signExtend28(self.io.read(u32, ref_base + 12));
 
-    const yi: i32 = @intCast(y);
-    const base_fb = @as(usize, y) * SCREEN_WIDTH;
+    const affine_idx: usize = bg - 2;
+    const x_ref = self.affine_x[affine_idx];
+    const y_ref = self.affine_y[affine_idx];
+    _ = y;
+
+    const out = &self.bg_line[bg];
     var x: i32 = 0;
     while (x < @as(i32, @intCast(SCREEN_WIDTH))) : (x += 1) {
-        // Affine transform: src = (PA*x + PB*y + X_ref, PC*x + PD*y + Y_ref) >> 8.
-        const sx = (pa * x + pb * yi + x_ref) >> 8;
-        const sy = (pc * x + pd * yi + y_ref) >> 8;
+        const sx = (pa * x + x_ref) >> 8;
+        const sy = (pc * x + y_ref) >> 8;
 
         var px = sx;
         var py = sy;
@@ -261,128 +536,72 @@ fn renderAffineBg(self: *Ppu, y: u16, bg: u2) void {
         if (tile_addr >= 0x1_0000) continue;
         const pixel = self.bus.vram[tile_addr];
         if (pixel == 0) continue;
-        self.framebuffer[base_fb + @as(usize, @intCast(x))] = bgr555ToArgb(pramBgColor(self.bus, pixel));
-    }
-}
-
-/// Sign-extend a 28-bit value (stored in the low bits of u32) to i32.
-inline fn signExtend28(v: u32) i32 {
-    return @as(i32, @bitCast(v << 4)) >> 4;
-}
-
-/// Variant for Mode 1: render a text BG directly into the framebuffer
-/// without the priority-merging buffer (since Mode 1 only has 2 text BGs).
-fn renderTextBgDirect(self: *Ppu, y: u16, bg: u2) void {
-    var line: [SCREEN_WIDTH]u32 = undefined;
-    var line_prio: [SCREEN_WIDTH]u8 = [_]u8{0xFF} ** SCREEN_WIDTH;
-    const base_fb = @as(usize, y) * SCREEN_WIDTH;
-    @memcpy(&line, self.framebuffer[base_fb .. base_fb + SCREEN_WIDTH]);
-    renderTextBg(self, y, bg, &line, &line_prio);
-    for (0..SCREEN_WIDTH) |x| {
-        if (line_prio[x] != 0xFF) self.framebuffer[base_fb + x] = line[x];
+        out[@intCast(x)] = .{
+            .color = pramBgColor(self.bus, pixel),
+            .priority = priority,
+            .flags = FLAG_OPAQUE,
+        };
     }
 }
 
 // =====================================================================
-// Mode 3: direct 16-bit 240×160 framebuffer
+// Bitmap modes 3/4/5 — written to BG2 line buffer
 // =====================================================================
 
-fn renderMode3(self: *Ppu, y: u16) void {
-    const base_fb = @as(usize, y) * SCREEN_WIDTH;
-    const base_vram = @as(u32, y) * SCREEN_WIDTH * 2;
-    for (0..SCREEN_WIDTH) |x| {
-        const c = vramReadU16(self.bus, base_vram + @as(u32, @intCast(x)) * 2);
-        self.framebuffer[base_fb + x] = bgr555ToArgb(c);
-    }
-}
-
-// =====================================================================
-// Mode 4: 8-bit palette indices, 240×160, double-buffered
-// =====================================================================
-
-fn renderMode4(self: *Ppu, y: u16, dispcnt: u16) void {
-    const base_fb = @as(usize, y) * SCREEN_WIDTH;
-    const page_offset: u32 = if ((dispcnt & 0x10) != 0) 0xA000 else 0; // DISPCNT bit 4 = page
-    const base_vram = page_offset + @as(u32, y) * SCREEN_WIDTH;
-    for (0..SCREEN_WIDTH) |x| {
-        const idx = self.bus.vram[base_vram + @as(u32, @intCast(x))];
-        const c = pramBgColor(self.bus, idx);
-        self.framebuffer[base_fb + x] = bgr555ToArgb(c);
-    }
-}
-
-// =====================================================================
-// Mode 5: 16-bit 160×128 framebuffer (smaller bitmap, centered)
-// =====================================================================
-
-fn renderMode5(self: *Ppu, y: u16, dispcnt: u16) void {
-    const base_fb = @as(usize, y) * SCREEN_WIDTH;
-    // Mode 5 displays only 160×128 centered; outside is the backdrop color.
-    const backdrop = bgr555ToArgb(pramBgColor(self.bus, 0));
-    if (y < 16 or y >= 144) {
-        for (0..SCREEN_WIDTH) |x| self.framebuffer[base_fb + x] = backdrop;
-        return;
-    }
+fn renderBitmapBg(self: *Ppu, y: u16, mode: u3, dispcnt: u16) void {
+    if ((dispcnt & (1 << 10)) == 0) return; // BG2 must be enabled
+    const bgcnt = self.io.read(u16, 0x00C); // BG2CNT
+    const priority: u8 = @intCast(bgcnt & 0x3);
+    const out = &self.bg_line[2];
     const page_offset: u32 = if ((dispcnt & 0x10) != 0) 0xA000 else 0;
-    const base_vram = page_offset + (@as(u32, y) - 16) * 160 * 2;
-    for (0..SCREEN_WIDTH) |x| {
-        if (x < 40 or x >= 200) {
-            self.framebuffer[base_fb + x] = backdrop;
-            continue;
-        }
-        const c = vramReadU16(self.bus, base_vram + (@as(u32, @intCast(x)) - 40) * 2);
-        self.framebuffer[base_fb + x] = bgr555ToArgb(c);
+    switch (mode) {
+        3 => {
+            const base_vram = @as(u32, y) * SCREEN_WIDTH * 2;
+            var x: usize = 0;
+            while (x < SCREEN_WIDTH) : (x += 1) {
+                const c = vramReadU16(self.bus, base_vram + @as(u32, @intCast(x)) * 2);
+                out[x] = .{ .color = c, .priority = priority, .flags = FLAG_OPAQUE };
+            }
+        },
+        4 => {
+            const base_vram = page_offset + @as(u32, y) * SCREEN_WIDTH;
+            var x: usize = 0;
+            while (x < SCREEN_WIDTH) : (x += 1) {
+                const idx = self.bus.vram[base_vram + @as(u32, @intCast(x))];
+                if (idx == 0) continue;
+                out[x] = .{
+                    .color = pramBgColor(self.bus, idx),
+                    .priority = priority,
+                    .flags = FLAG_OPAQUE,
+                };
+            }
+        },
+        5 => {
+            if (y < 16 or y >= 144) return;
+            const base_vram = page_offset + (@as(u32, y) - 16) * 160 * 2;
+            var x: usize = 40;
+            while (x < 200) : (x += 1) {
+                const c = vramReadU16(self.bus, base_vram + (@as(u32, @intCast(x)) - 40) * 2);
+                out[x] = .{ .color = c, .priority = priority, .flags = FLAG_OPAQUE };
+            }
+        },
+        else => {},
     }
 }
 
-// =====================================================================
-// Mode 0: text BG (up to 4 BG layers, no affine)
-// =====================================================================
-
-/// Render one scanline by compositing BG3 → BG0 with priority order, then
-/// filling with the backdrop (palette index 0) where nothing wrote.
-fn renderMode0(self: *Ppu, y: u16, dispcnt: u16) void {
-    const base_fb = @as(usize, y) * SCREEN_WIDTH;
-    const backdrop_color = bgr555ToArgb(pramBgColor(self.bus, 0));
-
-    // Per-pixel layer state: best priority found so far + whether it's set.
-    // We track (priority, color) and pick the lowest-priority hit.
-    var line: [SCREEN_WIDTH]u32 = [_]u32{backdrop_color} ** SCREEN_WIDTH;
-    var line_prio: [SCREEN_WIDTH]u8 = [_]u8{0xFF} ** SCREEN_WIDTH;
-
-    // Render BG3 first, then BG2, BG1, BG0 — lower BG index wins on equal priority.
-    var bg_idx: i32 = 3;
-    while (bg_idx >= 0) : (bg_idx -= 1) {
-        const bg: u2 = @intCast(bg_idx);
-        const enable_bit_pos: u4 = 8 + @as(u4, bg);
-        if ((dispcnt & (@as(u16, 1) << enable_bit_pos)) == 0) continue;
-        renderTextBg(self, y, bg, &line, &line_prio);
-    }
-
-    for (0..SCREEN_WIDTH) |x| self.framebuffer[base_fb + x] = line[x];
-}
-
-/// Render one text-BG scanline into the line buffer, respecting priority.
-fn renderTextBg(
-    self: *Ppu,
-    y: u16,
-    bg: u2,
-    line: *[SCREEN_WIDTH]u32,
-    line_prio: *[SCREEN_WIDTH]u8,
-) void {
+/// Render one text-BG scanline into `self.bg_line[bg]`.
+fn renderTextBg(self: *Ppu, y: u16, bg: u2) void {
     const cnt_offset: u32 = 0x008 + @as(u32, bg) * 2;
     const bgcnt = self.io.read(u16, cnt_offset);
     const priority: u8 = @intCast(bgcnt & 0x3);
     const char_block: u32 = (@as(u32, bgcnt) >> 2) & 0x3;
-    const palette_256 = (bgcnt & 0x0080) != 0; // 1 = 8bpp, 0 = 4bpp
+    const palette_256 = (bgcnt & 0x0080) != 0;
     const screen_block: u32 = (@as(u32, bgcnt) >> 8) & 0x1F;
     const size: u2 = @intCast((bgcnt >> 14) & 0x3);
 
-    // BG scroll: 9-bit signed values typically, but we just modulo into the map.
     const hofs = self.io.read(u16, 0x010 + @as(u32, bg) * 4) & 0x1FF;
     const vofs = self.io.read(u16, 0x012 + @as(u32, bg) * 4) & 0x1FF;
 
-    // Map size in pixels.
     const map_w: u32 = if ((size & 1) != 0) 512 else 256;
     const map_h: u32 = if ((size & 2) != 0) 512 else 256;
 
@@ -393,15 +612,14 @@ fn renderTextBg(
     const tile_y = py_global / 8;
     const py_in_tile = py_global & 7;
 
+    const out = &self.bg_line[bg];
+
     var x: u32 = 0;
     while (x < SCREEN_WIDTH) : (x += 1) {
-        if (line_prio[x] <= priority) continue;
-
         const px_global = (x + @as(u32, hofs)) & (map_w - 1);
         const tile_x = px_global / 8;
         const px_in_tile = px_global & 7;
 
-        // Pick correct screen block for 512-wide / 512-tall layouts.
         var sb = screen_base;
         if (map_w == 512 and tile_x >= 32) sb += 0x800;
         if (map_h == 512 and tile_y >= 32) sb += if (map_w == 512) @as(u32, 0x1000) else 0x800;
@@ -419,13 +637,16 @@ fn renderTextBg(
         const ty_in = if (flip_v) (7 - py_in_tile) else py_in_tile;
 
         const tile_size: u32 = if (palette_256) 64 else 32;
-        var pixel: u8 = undefined;
         if (palette_256) {
             const tile_addr = char_base + tile_num * tile_size + ty_in * 8 + tx_in;
-            if (tile_addr >= 0x1_0000) continue; // tiles must live in BG VRAM
-            pixel = self.bus.vram[tile_addr];
-            if (pixel == 0) continue; // transparent
-            line[x] = bgr555ToArgb(pramBgColor(self.bus, pixel));
+            if (tile_addr >= 0x1_0000) continue;
+            const pixel = self.bus.vram[tile_addr];
+            if (pixel == 0) continue;
+            out[x] = .{
+                .color = pramBgColor(self.bus, pixel),
+                .priority = priority,
+                .flags = FLAG_OPAQUE,
+            };
         } else {
             const tile_addr = char_base + tile_num * tile_size + ty_in * 4 + (tx_in / 2);
             if (tile_addr >= 0x1_0000) continue;
@@ -433,9 +654,12 @@ fn renderTextBg(
             const half: u8 = if ((tx_in & 1) != 0) (nib >> 4) else (nib & 0xF);
             if (half == 0) continue;
             const color_idx: u8 = @intCast(pal_bank * 16 + @as(u32, half));
-            line[x] = bgr555ToArgb(pramBgColor(self.bus, color_idx));
+            out[x] = .{
+                .color = pramBgColor(self.bus, color_idx),
+                .priority = priority,
+                .flags = FLAG_OPAQUE,
+            };
         }
-        line_prio[x] = priority;
     }
 }
 
@@ -444,7 +668,6 @@ fn renderTextBg(
 // =====================================================================
 
 fn renderSprites(self: *Ppu, y: u16, dispcnt: u16) void {
-    const base_fb = @as(usize, y) * SCREEN_WIDTH;
     const obj_one_d = (dispcnt & 0x40) != 0;
 
     var entry: u32 = 0;
@@ -454,9 +677,12 @@ fn renderSprites(self: *Ppu, y: u16, dispcnt: u16) void {
         const attr1 = @as(u16, self.bus.oam[oam_addr + 2]) | (@as(u16, self.bus.oam[oam_addr + 3]) << 8);
         const attr2 = @as(u16, self.bus.oam[oam_addr + 4]) | (@as(u16, self.bus.oam[oam_addr + 5]) << 8);
 
-        // Disable bit (only meaningful when affine off — bit 9 of attr0).
         const affine = (attr0 & 0x0100) != 0;
         if (!affine and (attr0 & 0x0200) != 0) continue;
+
+        // attr0 bits 11-10 = OBJ mode: 0=normal, 1=semi-transparent, 2=obj-window.
+        const obj_mode: u2 = @intCast((attr0 >> 10) & 0x3);
+        if (obj_mode == 3) continue; // forbidden
 
         const shape: u2 = @intCast((attr0 >> 14) & 0x3);
         const size: u2 = @intCast((attr1 >> 14) & 0x3);
@@ -489,15 +715,9 @@ fn renderSprites(self: *Ppu, y: u16, dispcnt: u16) void {
         while (px < w) : (px += 1) {
             const sx_pixel = sx + @as(i32, @intCast(px));
             if (sx_pixel < 0 or sx_pixel >= 240) continue;
+            const dst_x: usize = @intCast(sx_pixel);
             const px_in = if (flip_h) (w - 1 - px) else px;
 
-            // Tile lookup: OBJ tiles always start at VRAM 0x10000. `tile_num`
-            // from OAM is in 32-byte ("tile name") units regardless of color
-            // depth; a 256-color tile occupies two adjacent names.
-            //   1D mapping: tiles laid out sequentially → row stride = (w/8) names per row,
-            //               × 2 names per tile in 256-color.
-            //   2D mapping: 32×32 grid of names. Row stride = 32 names regardless of
-            //               color depth; horizontal tile step is 1 (16-color) or 2 (256-color).
             const tile_x = px_in / 8;
             const tile_y = py_in / 8;
             const tile_px = px_in & 7;
@@ -517,21 +737,32 @@ fn renderSprites(self: *Ppu, y: u16, dispcnt: u16) void {
 
             if (tile_addr >= 0x18000) continue;
 
-            var pixel: u8 = undefined;
+            // Resolve the pixel value (palette index).
+            var color_idx: u8 = 0;
             if (palette_256) {
-                pixel = self.bus.vram[tile_addr];
-                if (pixel == 0) continue;
-                const dst_x: usize = @intCast(sx_pixel);
-                self.framebuffer[base_fb + dst_x] = bgr555ToArgb(pramObjColor(self.bus, pixel));
+                color_idx = self.bus.vram[tile_addr];
+                if (color_idx == 0) continue;
             } else {
                 const nib = self.bus.vram[tile_addr];
                 const half: u8 = if ((tile_px & 1) != 0) (nib >> 4) else (nib & 0xF);
                 if (half == 0) continue;
-                const color_idx: u8 = @intCast(pal_bank * 16 + @as(u32, half));
-                const dst_x: usize = @intCast(sx_pixel);
-                self.framebuffer[base_fb + dst_x] = bgr555ToArgb(pramObjColor(self.bus, color_idx));
+                color_idx = @intCast(pal_bank * 16 + @as(u32, half));
             }
-            _ = priority; // M1.4: sprites always on top. BG/sprite priority lands later.
+
+            // OBJ-window sprites set the window mask and don't draw a pixel.
+            if (obj_mode == 2) {
+                self.obj_win[dst_x] = true;
+                continue;
+            }
+
+            // Keep only the highest-priority opaque OBJ pixel per x.
+            const cur = self.obj_line[dst_x];
+            if ((cur.flags & FLAG_OPAQUE) != 0 and cur.priority <= priority) continue;
+            self.obj_line[dst_x] = .{
+                .color = pramObjColor(self.bus, color_idx),
+                .priority = priority,
+                .flags = FLAG_OPAQUE | (if (obj_mode == 1) FLAG_OBJ_BLEND else @as(u8, 0)),
+            };
         }
     }
 }
