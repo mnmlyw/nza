@@ -22,6 +22,8 @@ pub const REG_IE: u32 = 0x200;
 pub const REG_IF: u32 = 0x202;
 pub const REG_IME: u32 = 0x208;
 pub const REG_HALTCNT: u32 = 0x301;
+pub const REG_SIOCNT: u32 = 0x128;
+pub const REG_SIOMULTI0: u32 = 0x120;
 
 /// DMA CNT_H byte offsets (low byte). High byte = +1.
 const DMA_CNT_H_OFFSETS: [4]u32 = .{ 0x0BA, 0x0C6, 0x0D2, 0x0DE };
@@ -147,6 +149,26 @@ pub const Io = struct {
             },
             else => {
                 self.raw[offset] = value;
+                // SIO single-player stub: on SIOCNT high-byte (0x129) write,
+                // if the start bit (bit 15) is set, simulate immediate
+                // transfer completion. Multi-mode reads of SIOMULTI0..3
+                // return 0xFFFF (no link partner). Raise SIO IRQ if enabled.
+                if (offset == REG_SIOCNT + 1) {
+                    if ((value & 0x80) != 0) {
+                        // Clear start bit; transfer "done".
+                        self.raw[REG_SIOCNT + 1] = value & 0x7F;
+                        // Multi mode: load SIOMULTI0..3 with 0xFFFF (no data
+                        // from absent peers); set this GBA's slot index to 0.
+                        const cnt_lo = self.raw[REG_SIOCNT];
+                        const mode_bits: u2 = @intCast((cnt_lo >> 4) & 0x3);
+                        _ = mode_bits;
+                        for (0..8) |i| self.raw[REG_SIOMULTI0 + i] = 0xFF;
+                        // IRQ on completion if SIOCNT bit 14 is set.
+                        if ((value & 0x40) != 0) {
+                            if (self.irq) |x| x.raise(.serial);
+                        }
+                    }
+                }
                 // FIFO_A (0x0A0..0x0A3) and FIFO_B (0x0A4..0x0A7) push
                 // 8-bit signed samples into the APU FIFOs.
                 if (self.apu) |apu| {
